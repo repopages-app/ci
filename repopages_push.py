@@ -824,7 +824,8 @@ def setup(a):
     if a.secret_file:
         secret = Path(a.secret_file).expanduser().read_text("utf-8").strip()
     else:
-        secret = os.environ.get("REPOPAGES_SECRET", "")
+        # Pasted values often carry a trailing newline; the secret is hex, so trimming is always safe.
+        secret = os.environ.get("REPOPAGES_SECRET", "").strip()
     if not a.dry_run and (not url or not secret):
         config_error("REPOPAGES_URL and REPOPAGES_SECRET (or --url / --secret-file) are required")
     if url:
