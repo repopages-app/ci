@@ -828,6 +828,10 @@ def setup(a):
         secret = os.environ.get("REPOPAGES_SECRET", "").strip()
     if not a.dry_run and (not url or not secret):
         config_error("REPOPAGES_URL and REPOPAGES_SECRET (or --url / --secret-file) are required")
+    if secret and not re.fullmatch(r"[0-9a-f]{64}", secret):
+        print(f"WARN REPOPAGES_SECRET is {len(secret)} characters, not the 64 hex characters RepoPages generates; "
+              "if pushes are rejected with 'invalid signature', copy the secret again (only the value, no line number)",
+              file=sys.stderr, flush=True)
     if url:
         url = url.strip()
         if not url.startswith("https://"):
