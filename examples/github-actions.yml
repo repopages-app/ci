@@ -1,0 +1,35 @@
+# .github/workflows/repopages.yml
+# Publishes changed Markdown to Confluence on every push to main; "Run workflow" does a full import.
+# Repository secrets (Settings > Secrets and variables > Actions):
+#   REPOPAGES_URL     the sync URL shown on Confluence settings > RepoPages
+#   REPOPAGES_SECRET  the secret shown once when the repository was mapped
+name: RepoPages
+on:
+  push:
+    branches: [main]
+    paths: ['**/*.md', '**/*.markdown']
+  workflow_dispatch:
+    inputs:
+      full_import:
+        description: 'Send every Markdown file (unchanged pages are skipped)'
+        type: boolean
+        default: false
+      force:
+        description: 'Rewrite every page even if unchanged (implies a full import)'
+        type: boolean
+        default: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # push mode diffs HEAD~1..HEAD
+      - uses: repopages-app/ci@v1
+        with:
+          url: ${{ secrets.REPOPAGES_URL }}
+          secret: ${{ secrets.REPOPAGES_SECRET }}
+          prefix: docs/
+          mode: ${{ (inputs.full_import || inputs.force) && 'import' || 'push' }}
+          force: ${{ inputs.force || false }}
+          exclude: CLAUDE.md

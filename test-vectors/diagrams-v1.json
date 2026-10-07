@@ -1,0 +1,48 @@
+{
+  "comment": "Diagram fences: index/lang/source hash as the app's converter (marked) sees them, and the 1-based opening line. Checked by test/convert.test.ts and repopages_push.py selftest.",
+  "markdown": "---\r\ntitle: x\r\n---\r\n# Diagrams\r\n\r\n```mermaid\r\ngraph LR\r\n  A-->B\r\n```\r\n\r\n````markdown\r\n```mermaid\r\nnot a diagram\r\n```\r\n````\r\n\r\n~~~plantuml\r\n@startuml\r\na -> b\r\n@enduml\r\n~~~\r\n\r\n> quoted:\r\n>\r\n> ```mermaid\r\n> sequenceDiagram\r\n>   A->>B: hi\r\n> ```\r\n\r\n1. step\r\n\r\n   ```mermaid title=\"x\"\r\n   pie\r\n     \"a\": 1\r\n   ```\r\n\r\n```Mermaid\r\ngraph TD\r\n\r\n  C-->D\r\n```\r\n\r\n```js\r\nconst s = \"```mermaid\";\r\n```\r\n\r\n!!! note \"Diagram\"\r\n    ```mermaid\r\n    graph TD\r\n      E-->F\r\n    ```\r\n\r\n::: tip\r\n```plantuml\r\n@startuml\r\nx -> y\r\n@enduml\r\n```\r\n:::\r\n",
+  "blocks": [
+    {
+      "index": 0,
+      "lang": "mermaid",
+      "line": 6,
+      "hash": "d5c047f8820834b2b424e567388f6ca5e0650662174c700e5a12bfd089074287"
+    },
+    {
+      "index": 1,
+      "lang": "plantuml",
+      "line": 17,
+      "hash": "582dde3cd6c5d7cb51f3a35d76cfcccf4f4ad6d2f78cedd054a7b7dc0b16e815"
+    },
+    {
+      "index": 2,
+      "lang": "mermaid",
+      "line": 25,
+      "hash": "a3a056692648b4081dc3dc13362dd4c0376be65032c102f47dd0add92ca691d2"
+    },
+    {
+      "index": 3,
+      "lang": "mermaid",
+      "line": 32,
+      "hash": "2cddd04ad13e89d0959c8691267b8c2a0f637e5faf4d0415276a18c36d2b9d79"
+    },
+    {
+      "index": 4,
+      "lang": "mermaid",
+      "line": 37,
+      "hash": "6e4b22a48e87baf393fe39316136330a68fd831eadb00d303323d81335ce851e"
+    },
+    {
+      "index": 5,
+      "lang": "mermaid",
+      "line": 48,
+      "hash": "e7b6a41d86a1f09bf0d50870b65bfe5423bcea36e73698a1b22fa94cd271e528"
+    },
+    {
+      "index": 6,
+      "lang": "plantuml",
+      "line": 54,
+      "hash": "5c3c9f6ad905b2d3537fa400baa23f842f38ad9b478da3dd73b84611de8f56ad"
+    }
+  ]
+}

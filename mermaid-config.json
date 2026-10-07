@@ -1,0 +1,35 @@
+{
+  "theme": "base",
+  "themeVariables": {
+    "primaryColor": "#ECECFF",
+    "primaryTextColor": "#1f1f1f",
+    "primaryBorderColor": "#9370DB",
+    "secondaryColor": "#fff4dd",
+    "tertiaryColor": "#f4f4f8",
+    "lineColor": "#8a8a8a",
+    "edgeLabelBackground": "#e9e9ee",
+    "clusterBkg": "#f4f4f8",
+    "clusterBorder": "#9370DB",
+    "actorBkg": "#ECECFF",
+    "actorBorder": "#9370DB",
+    "actorTextColor": "#1f1f1f",
+    "actorLineColor": "#8a8a8a",
+    "signalColor": "#8a8a8a",
+    "signalTextColor": "#8a8a8a",
+    "labelBoxBkgColor": "#ECECFF",
+    "labelBoxBorderColor": "#9370DB",
+    "labelTextColor": "#1f1f1f",
+    "loopTextColor": "#8a8a8a",
+    "noteBkgColor": "#fff5ad",
+    "noteBorderColor": "#aaaa33",
+    "noteTextColor": "#1f1f1f",
+    "activationBkgColor": "#f4f4f8",
+    "activationBorderColor": "#8a8a8a",
+    "sequenceNumberColor": "#ffffff"
+  },
+  "themeCSS": "text.actor.actor-man>tspan{fill:#8a8a8a;} .edgeTerminals .edgeLabel{color:#8a8a8a;} .edgeTerminals text{fill:#8a8a8a;} .edgeLabel rect{opacity:1;}",
+  "htmlLabels": false,
+  "flowchart": {
+    "htmlLabels": false
+  }
+}

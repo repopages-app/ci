@@ -1,0 +1,4 @@
+# Send only what the image needs.
+*
+!repopages_push.py
+!mermaid-config.json

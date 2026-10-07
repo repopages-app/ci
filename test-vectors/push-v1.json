@@ -1,0 +1,6 @@
+{
+  "description": "HMAC-SHA256 of the UTF-8 bytes of `body`, keyed with `secret`; header value X-RepoPages-Signature. Checked by test/sync.test.ts and examples/ci/repopages_push.py selftest.",
+  "secret": "repopages-test-vector-secret-0123456789abcdef",
+  "body": "{\"repo\":\"owner/name\",\"ref\":\"refs/heads/main\",\"sha\":\"0123456789abcdef0123456789abcdef01234567\",\"shortSha\":\"0123456\",\"commitUrl\":\"https://github.com/owner/name/commit/0123456789abcdef0123456789abcdef01234567\",\"pushedAt\":\"2026-10-06T10:00:00+00:00\",\"mode\":\"import\",\"files\":[{\"path\":\"docs/intro.md\",\"action\":\"added\",\"content\":\"# Intro — Grüße ✓\\n\\nSee [setup](setup.md).\\n\",\"force\":true},{\"path\":\"docs/gone.md\",\"action\":\"removed\"}]}",
+  "signature": "sha256=a3a520cba8adb092cb92b524a75fe5bb995d276f23234d3540d8fdcb6a63fe0f"
+}

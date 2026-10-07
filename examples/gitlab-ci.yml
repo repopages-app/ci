@@ -1,0 +1,17 @@
+# .gitlab-ci.yml
+# CI/CD variable (Settings > CI/CD > Variables, masked and protected):
+#   REPOPAGES_SECRET  the secret shown once on the RepoPages settings page
+repopages:
+  image: ghcr.io/repopages-app/ci:1
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: ['**/*.md', '**/*.markdown']
+    - if: $CI_PIPELINE_SOURCE == "web"   # Run pipeline with FULL_IMPORT=true for a full import
+  variables:
+    GIT_DEPTH: "2"
+    DOCS_PREFIX: "docs/"
+    REPOPAGES_URL: "<sync URL from Confluence settings > RepoPages>"
+  script:
+    - export GITHUB_SERVER_URL="$CI_SERVER_URL" GITHUB_REF="refs/heads/$CI_COMMIT_BRANCH"
+    - if [ "$FULL_IMPORT" = "true" ]; then MODE=import; else MODE=push; fi
+    - repopages "$MODE" --repo "$CI_PROJECT_PATH"

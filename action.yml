@@ -1,0 +1,93 @@
+name: RepoPages
+description: Publish the Markdown changed by a commit (or a whole tree) as Confluence pages through RepoPages, with Mermaid and PlantUML rendered on the runner.
+author: RepoPages
+branding:
+  icon: upload-cloud
+  color: blue
+
+inputs:
+  url:
+    description: The sync web trigger URL shown on Confluence settings > RepoPages. Store it as a repository secret.
+    required: true
+  secret:
+    description: The signing secret shown once when the repository was mapped. Store it as a repository secret.
+    required: true
+  mode:
+    description: "`push` sends the Markdown files changed by the commit (needs `fetch-depth: 2` on checkout); `import` sends every Markdown file in the tree."
+    default: push
+  prefix:
+    description: The folder the mapping covers, with a trailing slash (`docs/`). Empty for the whole repository.
+    default: ''
+  force:
+    description: Rewrite pages even when the file is unchanged (`true`/`false`).
+    default: 'false'
+  exclude:
+    description: Comma-separated globs to leave out, for example `CLAUDE.md,drafts/**`.
+    default: ''
+  render:
+    description: "`auto` renders Mermaid and PlantUML blocks on the runner; `off` sends them as code."
+    default: auto
+  args:
+    description: Extra flags for the client, for example `--allow-partial` or `--allow-missing-renderer`.
+    default: ''
+  mermaid-cli:
+    description: Command that runs the Mermaid CLI. The runner's Chrome is used, no browser is downloaded.
+    default: npx -y @mermaid-js/mermaid-cli@11
+  plantuml-version:
+    description: PlantUML MIT build to download (cached between runs).
+    default: '1.2026.8'
+  plantuml-sha256:
+    description: SHA-256 of that plantuml-mit jar.
+    default: 3629c9cd017c7f73e6450396eea0040216c7e1eef8473ce33cc1aad469dab2f9
+
+runs:
+  using: composite
+  steps:
+    - name: Cache plantuml.jar
+      if: inputs.render != 'off'
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/plantuml
+        key: plantuml-mit-${{ inputs.plantuml-version }}
+
+    - name: Prepare diagram renderers
+      if: inputs.render != 'off'
+      # Never fails here: a renderer still missing afterwards fails the push step with exit 2
+      # and nothing sent, unless `args` has --allow-missing-renderer.
+      continue-on-error: true
+      shell: bash
+      env:
+        PLANTUML_VERSION: ${{ inputs.plantuml-version }}
+        PLANTUML_SHA256: ${{ inputs.plantuml-sha256 }}
+        PLANTUML_JAR: ${{ runner.temp }}/plantuml/plantuml.jar
+        MERMAID_CLI: ${{ inputs.mermaid-cli }}
+        PUPPETEER_SKIP_DOWNLOAD: 'true'
+      run: |
+        mkdir -p "$(dirname "$PLANTUML_JAR")"
+        if [ ! -f "$PLANTUML_JAR" ]; then
+          curl -fsSL -o "$PLANTUML_JAR" \
+            "https://github.com/plantuml/plantuml/releases/download/v$PLANTUML_VERSION/plantuml-mit-$PLANTUML_VERSION.jar"
+        fi
+        echo "$PLANTUML_SHA256  $PLANTUML_JAR" | sha256sum -c - || rm -f "$PLANTUML_JAR"
+        java -version
+        echo "CHROME_BIN=$CHROME_BIN"
+        $MERMAID_CLI --version   # installs the Mermaid CLI into the npx cache once
+
+    - name: Sign and send to RepoPages
+      shell: bash
+      env:
+        REPOPAGES_URL: ${{ inputs.url }}
+        REPOPAGES_SECRET: ${{ inputs.secret }}
+        DOCS_PREFIX: ${{ inputs.prefix }}
+        REPOPAGES_EXCLUDE: ${{ inputs.exclude }}
+        MODE: ${{ inputs.mode }}
+        FORCE: ${{ inputs.force }}
+        RENDER: ${{ inputs.render }}
+        EXTRA_ARGS: ${{ inputs.args }}
+        PLANTUML_JAR: ${{ runner.temp }}/plantuml/plantuml.jar
+        MERMAID_CLI: ${{ inputs.mermaid-cli }}
+        PUPPETEER_SKIP_DOWNLOAD: 'true'
+      run: |
+        ARGS="--render $RENDER"
+        if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
+        python3 "$GITHUB_ACTION_PATH/repopages_push.py" "$MODE" $ARGS $EXTRA_ARGS
