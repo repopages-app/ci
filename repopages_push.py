@@ -827,6 +827,11 @@ def setup(a):
         secret = os.environ.get("REPOPAGES_SECRET", "")
     if not a.dry_run and (not url or not secret):
         config_error("REPOPAGES_URL and REPOPAGES_SECRET (or --url / --secret-file) are required")
+    if url:
+        url = url.strip()
+        if not url.startswith("https://"):
+            config_error("REPOPAGES_URL must be the sync URL from the RepoPages settings page (it starts with https://); "
+                         f"got a value of {len(url)} characters that does not")
     git = Git(a.repo_dir, a.rev)
     repo = a.repo or os.environ.get("GITHUB_REPOSITORY")
     if not repo:
