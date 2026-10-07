@@ -1045,7 +1045,7 @@ def cmd_selftest(_a) -> int:
     ], got
 
     # 6. Diagram fences: ordinal, language, opening line and source hash, as the app sees them.
-    vec2 = Path(__file__).resolve().parents[2] / "test-vectors" / "diagrams-v1.json"
+    vec2 = next((c.with_name("diagrams-v1.json") for c in candidates if c.with_name("diagrams-v1.json").is_file()), candidates[0].with_name("diagrams-v1.json"))
     if vec2.is_file():
         dv = json.loads(vec2.read_text("utf-8"))
         got = [{"index": b["index"], "lang": b["lang"], "line": b["line"],
