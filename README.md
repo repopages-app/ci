@@ -1,6 +1,6 @@
 # RepoPages CI client
 
-Docs as code for Confluence. The client side of [RepoPages for Confluence](https://marketplace.atlassian.com/): your CI runs it on every push, it signs the Markdown files that changed and sends them to RepoPages, which writes one Confluence page per file. Mermaid and PlantUML blocks are rendered here, on your runner, and sent as SVG. Nothing in Confluence ever connects to your Git host.
+Docs as code for Confluence. The client side of [RepoPages for Confluence](https://marketplace.atlassian.com/): your CI runs it on every push, it signs the Markdown files that changed and sends them to RepoPages, which writes one Confluence page per file. Mermaid and PlantUML blocks are rendered here, on your runner, and sent as SVG. Nothing in Confluence ever connects to your Git host. That makes private, self-hosted and VPN-only repositories work without any OAuth grant or GitHub app: the only thing that reads the repository is your own CI.
 
 Three ways to run it:
 
