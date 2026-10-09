@@ -1,0 +1,6 @@
+{
+  "description": "Write-back acknowledgement (push payload with files [] and pending entries). HMAC-SHA256 of the UTF-8 bytes of `body`, keyed with `secret`; header value X-RepoPages-Signature. Checked by repopages_push.py selftest; the RepoPages app repo has the same file.",
+  "secret": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "body": "{\"repo\":\"owner/name\",\"ref\":\"refs/heads/main\",\"sha\":\"0123456789abcdef0123456789abcdef01234567\",\"shortSha\":\"0123456\",\"commitUrl\":\"https://github.com/owner/name/commit/0123456789abcdef0123456789abcdef01234567\",\"pushedAt\":\"2026-10-09T10:00:00+00:00\",\"files\":[],\"pending\":[{\"path\":\"docs/prompts/support-reply-drafter.md\",\"pageVersion\":17,\"mrUrl\":\"https://github.com/owner/name/pull/42\",\"mrState\":\"open\"},{\"path\":\"docs/café.md\",\"pageVersion\":5,\"mrUrl\":\"https://github.com/owner/name/pull/41\",\"mrState\":\"closed\"}]}",
+  "signature": "sha256=732952646c1fa8cebab5ad754a7b0432b333dce465e2b7b7c3ef8f2a5cd7dae6"
+}

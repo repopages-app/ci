@@ -1,5 +1,5 @@
 name: RepoPages
-description: Publish the Markdown changed by a commit (or a whole tree) as Confluence pages through RepoPages, with Mermaid and PlantUML rendered on the runner.
+description: Publish the Markdown changed by a commit (or a whole tree) as Confluence pages through RepoPages, with Mermaid and PlantUML rendered on the runner, and turn edits made in Confluence into pull requests.
 author: RepoPages
 branding:
   icon: upload-cloud
@@ -13,8 +13,26 @@ inputs:
     description: The signing secret shown once when the repository was mapped. Store it as a repository secret.
     required: true
   mode:
-    description: "`push` sends the Markdown files changed by the commit (needs `fetch-depth: 2` on checkout); `import` sends every Markdown file in the tree."
+    description: "`push` sends the Markdown files changed by the commit (needs `fetch-depth: 2` on checkout); `import` sends every Markdown file in the tree; `pull-edits` opens a pull request for every page edited in Confluence (needs `fetch-depth: 0` and `permissions: contents: write, pull-requests: write`)."
     default: push
+  confluence-site:
+    description: "pull-edits: your Confluence Cloud site, for example `https://acme.atlassian.net`."
+    default: ''
+  confluence-email:
+    description: "pull-edits: the Atlassian account the API token belongs to. Store it as a secret."
+    default: ''
+  confluence-token:
+    description: "pull-edits: an Atlassian API token, classic or scoped (read:page:confluence, read:attachment:confluence, search:confluence). Store it as a secret."
+    default: ''
+  confluence-space:
+    description: "pull-edits: only look at pages in this space key. Empty: every space the token can read."
+    default: ''
+  base:
+    description: "pull-edits: the branch pull requests target. Empty: the repository's default branch."
+    default: ''
+  mr:
+    description: "pull-edits: `github` (default on GitHub Actions) opens pull requests with gh; `none` only pushes the branches."
+    default: ''
   prefix:
     description: The folder the mapping covers, with a trailing slash (`docs/`). Empty for the whole repository.
     default: ''
@@ -44,14 +62,14 @@ runs:
   using: composite
   steps:
     - name: Cache plantuml.jar
-      if: inputs.render != 'off'
+      if: inputs.render != 'off' && inputs.mode != 'pull-edits'
       uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/plantuml
         key: plantuml-mit-${{ inputs.plantuml-version }}
 
     - name: Prepare diagram renderers
-      if: inputs.render != 'off'
+      if: inputs.render != 'off' && inputs.mode != 'pull-edits'
       # Never fails here: a renderer still missing afterwards fails the push step with exit 2
       # and nothing sent, unless `args` has --allow-missing-renderer.
       continue-on-error: true
@@ -74,6 +92,7 @@ runs:
         $MERMAID_CLI --version   # installs the Mermaid CLI into the npx cache once
 
     - name: Sign and send to RepoPages
+      if: inputs.mode != 'pull-edits'
       shell: bash
       env:
         REPOPAGES_URL: ${{ inputs.url }}
@@ -91,3 +110,25 @@ runs:
         ARGS="--render $RENDER"
         if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
         python3 "$GITHUB_ACTION_PATH/repopages_push.py" "$MODE" $ARGS $EXTRA_ARGS
+
+    - name: Turn Confluence edits into pull requests
+      if: inputs.mode == 'pull-edits'
+      # Needs in the workflow: permissions contents: write and pull-requests: write, a checkout with
+      # fetch-depth: 0, and Settings > Actions > General > "Allow GitHub Actions to create and approve
+      # pull requests". Exit codes: 2 configuration, 3 acknowledgement rejected, 4 a PR could not be opened.
+      shell: bash
+      env:
+        REPOPAGES_URL: ${{ inputs.url }}
+        REPOPAGES_SECRET: ${{ inputs.secret }}
+        CONFLUENCE_SITE: ${{ inputs.confluence-site }}
+        CONFLUENCE_EMAIL: ${{ inputs.confluence-email }}
+        CONFLUENCE_TOKEN: ${{ inputs.confluence-token }}
+        CONFLUENCE_SPACE_KEY: ${{ inputs.confluence-space }}
+        REPOPAGES_BASE: ${{ inputs.base || github.event.repository.default_branch }}
+        MR: ${{ inputs.mr }}
+        EXTRA_ARGS: ${{ inputs.args }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        ARGS=""
+        if [ -n "$MR" ]; then ARGS="--mr $MR"; fi
+        python3 "$GITHUB_ACTION_PATH/repopages_push.py" pull-edits $ARGS $EXTRA_ARGS

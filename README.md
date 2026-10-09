@@ -110,6 +110,95 @@ python3 repopages_push.py selftest                                      # offlin
 
 Exit codes: `0` everything accepted, or nothing to send; `1` a call failed after the retry; `2` configuration or renderer error, nothing sent; `3` every chunk was sent but some files failed on the Confluence side (HTTP 207; the settings page lists them under Manage → Last run). `--allow-partial` turns 3 into a warning.
 
+## Edits made in Confluence
+
+Git stays the source of truth, but people who live in Confluence can still change a page. When someone edits a synced page, RepoPages does not throw the edit away and does not write to Git. It marks the page instead:
+
+- the byline chip changes to **RepoPages · pending review**, and its popup says the edit is waiting to become a merge request;
+- the page gets the label `repopages-pending` and an attachment `repopages-pending.md` with the proposed Markdown file;
+- if the edit uses something the converter cannot turn back into Markdown yet (tables, images, most macros), the chip says **not sent** and why. The edit stays in the page history and nothing goes to Git.
+
+A job in **your** CI then picks the edit up: `repopages_push.py pull-edits` reads the pending pages with a read-only Confluence token, pushes one branch per edit and opens a pull request (GitLab: merge request) with the editor's name in it, then tells RepoPages the link. The chip changes to **RepoPages · merge request** and links to it. Review and merge as usual; the push of the merge rewrites the page from Git and the pending mark disappears. RepoPages itself never calls GitHub or GitLab and holds no credential for your repository; everything that touches Git runs on your runner, with your runner's permissions.
+
+What the pull request contains:
+
+- branch `repopages/edit-<page id>-v<page version>`, one commit `Confluence edit: <path>` by `RepoPages <noreply@repopages.app>` (change it with `REPOPAGES_GIT_AUTHOR="Docs Bot <docs@acme.com>"`), with the trailers `Edited-in-Confluence-by: <name>` and `Confluence-page: <link>`;
+- if the file changed in Git since the page was last synced, the edit is merged onto the current version with `git merge-file`. Overlapping changes are left as conflict markers and the pull request gets the label `needs-attention`. Nothing is dropped silently;
+- branches are never force-pushed. A page edited again gets a new branch for its new version.
+
+### When it runs
+
+Nothing in Confluence can start your CI on its own, so pick one or more:
+
+| Trigger | Delay | Needs |
+|---|---|---|
+| Run the workflow by hand (`workflow_dispatch`, GitLab "Run pipeline") | none | nothing |
+| Schedule, hourly (`0 * * * *`) or nightly | up to the interval | nothing; an empty run takes about 30 s of CI time, so every 15 minutes would use over half of a private repository's free GitHub minutes |
+| A Confluence Automation rule: label `repopages-pending` added → Send web request to `repository_dispatch` or a GitLab pipeline trigger | about a minute | Confluence Premium or Enterprise, and a token stored in the rule ([how](examples/confluence-automation-rule.md)) |
+
+### The Confluence token
+
+The job reads Confluence with an Atlassian API token of an account that can see the mapped spaces (a service account is best). Create it at **id.atlassian.com → Security → API tokens**. A scoped token is recommended; it needs only
+
+- `read:page:confluence`
+- `read:attachment:confluence`
+- `search:confluence`
+
+A classic (unscoped) token works too. The client tries `https://<site>/wiki` first and switches to `https://api.atlassian.com/ex/confluence/<cloud id>` (which scoped tokens require) when the site answers 401 or 403; `--scoped-token` goes there directly. The token never leaves your CI and is never printed.
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/repopages-pull-edits.yml
+name: RepoPages edits
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  pull-edits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: repopages-app/ci@v1
+        with:
+          mode: pull-edits
+          url: ${{ secrets.REPOPAGES_URL }}
+          secret: ${{ secrets.REPOPAGES_SECRET }}
+          confluence-site: https://acme.atlassian.net
+          confluence-email: ${{ secrets.CONFLUENCE_EMAIL }}
+          confluence-token: ${{ secrets.CONFLUENCE_TOKEN }}
+```
+
+Also turn on **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests**, or opening the pull request fails with HTTP 403. Pull requests opened with the workflow's token do not start other workflows (a GitHub rule); push to the branch or close and reopen the pull request to run your checks. The full file, with the Automation trigger, is [`examples/github-actions-pull-edits.yml`](examples/github-actions-pull-edits.yml); the GitLab job is at the end of [`examples/gitlab-ci.yml`](examples/gitlab-ci.yml) and needs a project access token (`GITLAB_TOKEN`, scopes `api` and `write_repository`).
+
+Inputs for `mode: pull-edits` (besides `url` and `secret`):
+
+| Input | Default | Meaning |
+|---|---|---|
+| `confluence-site` | required | `https://acme.atlassian.net` |
+| `confluence-email`, `confluence-token` | required | the token's account and the token, as secrets |
+| `confluence-space` | every space | only pages in this space key |
+| `base` | the default branch | the branch pull requests target |
+| `mr` | `github` | `none` pushes the branches only and prints the pull requests to open |
+| `args` | `''` | extra flags, e.g. `--dry-run` or `--no-ack` |
+
+### From the command line
+
+```sh
+export CONFLUENCE_SITE=https://acme.atlassian.net CONFLUENCE_EMAIL=bot@acme.com CONFLUENCE_TOKEN=...
+python3 repopages_push.py pull-edits --repo owner/name --dry-run    # show what would be opened; changes nothing
+```
+
+`--dry-run` lists the pending pages, what each proposal contains and which branch and pull request it would create; it pushes, opens and sends nothing. Other flags: `--space KEY`, `--base BRANCH`, `--branch-prefix` (default `repopages/edit`), `--mr github|gitlab|none` (default: `github` on GitHub Actions, `gitlab` on GitLab CI, else `none`), `--no-ack`, `--scoped-token`, `--confluence-token-file`.
+
+Exit codes of `pull-edits`: `0` done (a malformed attachment is a warning, the page is skipped); `1` Confluence could not be read; `2` configuration error (site, email, token, repository, or the sync URL and secret missing) or Confluence refused the token; `3` RepoPages did not accept the report of the opened pull requests (check `REPOPAGES_URL` and `REPOPAGES_SECRET`); `4` a branch could not be pushed or a pull request could not be opened (the next run retries it).
+
 ## Versions
 
 Tags follow semver. `v1` moves with every 1.x release, so `uses: repopages-app/ci@v1` and `ghcr.io/repopages-app/ci:1` pick up fixes; pin `@v1.0.0` or `:1.0.0` for a fixed version. The client and the app share a payload contract; a new major version of the client is only needed when that contract changes.

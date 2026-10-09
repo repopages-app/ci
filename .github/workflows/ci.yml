@@ -11,6 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 repopages_push.py selftest
+      - run: python3 -I -m unittest -v
 
   action:
     # The composite action against this checkout: renderers prepared, a dry run, nothing sent.

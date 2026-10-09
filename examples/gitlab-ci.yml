@@ -4,6 +4,8 @@
 repopages:
   image: ghcr.io/repopages-app/ci:1
   rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger"
+      when: never   # those pipelines run repopages-pull-edits below (`changes` is always true for them)
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes: ['**/*.md', '**/*.markdown']
     - if: $CI_PIPELINE_SOURCE == "web"   # Run pipeline with FULL_IMPORT=true for a full import
@@ -15,3 +17,27 @@ repopages:
     - export GITHUB_SERVER_URL="$CI_SERVER_URL" GITHUB_REF="refs/heads/$CI_COMMIT_BRANCH"
     - if [ "$FULL_IMPORT" = "true" ]; then MODE=import; else MODE=push; fi
     - repopages "$MODE" --repo "$CI_PROJECT_PATH"
+
+# Edits made in Confluence -> merge requests. Runs in a pipeline schedule (Build > Pipeline schedules,
+# hourly "0 * * * *", variable REPOPAGES_JOB=pull-edits) or a pipeline trigger from a Confluence
+# Automation rule (see confluence-automation-rule.md).
+# CI/CD variables (masked and protected):
+#   REPOPAGES_SECRET    as above
+#   CONFLUENCE_EMAIL    the Atlassian account of the token
+#   CONFLUENCE_TOKEN    its API token: classic, or scoped with read:page:confluence,
+#                       read:attachment:confluence, search:confluence
+#   GITLAB_TOKEN        a project access token, role Developer, scopes api + write_repository: pushes the
+#                       repopages/edit-* branches and opens the merge requests (CI_JOB_TOKEN usually
+#                       cannot do either)
+repopages-pull-edits:
+  image: ghcr.io/repopages-app/ci:1
+  rules:
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger") && $REPOPAGES_JOB == "pull-edits"
+  resource_group: repopages-pull-edits   # one run at a time
+  variables:
+    GIT_DEPTH: "0"          # the edit's base commit is needed to merge onto newer changes
+    CONFLUENCE_SITE: "https://acme.atlassian.net"
+    REPOPAGES_URL: "<sync URL from Confluence settings > RepoPages>"
+  script:
+    - export GITHUB_SERVER_URL="$CI_SERVER_URL"
+    - repopages pull-edits --repo "$CI_PROJECT_PATH" --mr gitlab

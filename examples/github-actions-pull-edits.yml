@@ -1,0 +1,42 @@
+# .github/workflows/repopages-pull-edits.yml
+# Turns edits made in Confluence into pull requests. RepoPages marks an edited page "pending review"
+# and keeps the proposed Markdown on the page; this job reads it, opens one pull request per edit and
+# reports the link back, so the page shows it. The app itself never calls GitHub.
+#
+# Repository secrets (Settings > Secrets and variables > Actions):
+#   REPOPAGES_URL, REPOPAGES_SECRET   as for the publishing workflow
+#   CONFLUENCE_EMAIL                  the Atlassian account of the token
+#   CONFLUENCE_TOKEN                  an API token of that account: classic, or scoped with
+#                                     read:page:confluence, read:attachment:confluence, search:confluence
+# Repository setting: Settings > Actions > General > Workflow permissions >
+#   "Allow GitHub Actions to create and approve pull requests" (otherwise gh pr create gets HTTP 403).
+# Pull requests opened with the workflow token do not start other workflows; close and reopen one, or
+# push to it, to run your checks.
+name: RepoPages edits
+on:
+  schedule:
+    - cron: '0 * * * *'     # hourly; an empty run takes ~30 s of Actions time. Nightly: '0 3 * * *'
+  workflow_dispatch:        # Actions > RepoPages edits > Run workflow, for "now"
+  repository_dispatch:      # optional, from a Confluence Automation rule (Premium):
+    types: [repopages-pull-edits]   # see examples/confluence-automation-rule.md
+concurrency: repopages-pull-edits   # a manual run and the schedule never race on the same branch
+permissions:
+  contents: write           # push the repopages/edit-* branches
+  pull-requests: write      # open the pull requests
+jobs:
+  pull-edits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # the edit's base commit is needed to merge onto newer changes
+      - uses: repopages-app/ci@v1
+        with:
+          mode: pull-edits
+          url: ${{ secrets.REPOPAGES_URL }}
+          secret: ${{ secrets.REPOPAGES_SECRET }}
+          confluence-site: https://acme.atlassian.net
+          confluence-email: ${{ secrets.CONFLUENCE_EMAIL }}
+          confluence-token: ${{ secrets.CONFLUENCE_TOKEN }}
+          # confluence-space: DOCS   # only this space
+          # base: main               # default: the repository's default branch

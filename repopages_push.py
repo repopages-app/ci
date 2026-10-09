@@ -10,8 +10,9 @@ Subcommands:
               pass 2  only files with a relative page link, so links to pages created in later
                       chunks of pass 1 resolve. The app rewrites a page only if a link target now
                       resolves differently, so re-running an import creates no new page versions.
-  selftest  Offline checks: HMAC test vector, chunking, exclusion globs, link detection, diagram fences,
-            code includes.
+  pull-edits  Turn edits made in Confluence into merge requests (see "Edits made in Confluence" below).
+  selftest  Offline checks: HMAC test vectors, chunking, exclusion globs, link detection, diagram fences,
+            code includes, the pending-edit header parser and the acknowledgement payload.
 
 Code includes (--includes on, the default): FastAPI-style markers `{* ../../docs_src/app.py ln[1:9] *}`
 are replaced by a fenced code block with that file's content from REV, because the app only sees
@@ -59,6 +60,46 @@ chunks are still sent; at the end the client prints `ERROR <n> chunk(s) were onl
 applied; ...` and exits with 3, so the CI job fails. --allow-partial prints that as a WARN and
 exits 0 instead. Which files failed: the RepoPages settings page (Manage > Last run) or the app
 logs (`sync.failed_file` events).
+
+Edits made in Confluence (pull-edits): when someone edits a synced page in Confluence, RepoPages
+labels the page `repopages-pending` and attaches `repopages-pending.md`: a header line
+`<!-- repopages-pending {"repo":..,"path":..,"baseSha":..,"pageId":..,"version":..,"editorName":..,
+"at":..,"proposalHash":<sha256 of the rest>} -->` and then the full proposed Markdown file. The app
+never calls Git; this subcommand, run by your CI on a schedule, does:
+  1. CQL `label = "repopages-pending" and type = page` (and `space = KEY` with --space) through the
+     Confluence REST API; for each page download repopages-pending.md (pages without it carry an edit
+     that could not be converted: skipped), check the header and the hash (a malformed one is a WARN
+     and skipped), skip proposals for another repository.
+  2. Branch `<--branch-prefix>-<pageId>-v<version>` (default repopages/edit-123-v17). If it already
+     exists on origin the edit was proposed before: its merge request is looked up and acknowledged
+     again. Otherwise the branch is made from origin/<--base> in a temporary `git worktree` (your
+     checkout is untouched), the file is written at its path (three-way merged with `git merge-file`
+     when the file changed in Git since baseSha; conflict markers are kept and the merge request gets
+     the label `needs-attention`), committed as $REPOPAGES_GIT_AUTHOR (default
+     "RepoPages <noreply@repopages.app>") with the trailers Edited-in-Confluence-by and
+     Confluence-page, pushed (never forced), and the merge request is opened: --mr github runs
+     `gh pr create` (GH_TOKEN, or GITHUB_TOKEN); --mr gitlab uses the GitLab API with GITLAB_TOKEN
+     (a project access token with api and write_repository; also used to push) or CI_JOB_TOKEN;
+     --mr none pushes the branch and prints the merge request to open by hand.
+  3. One signed POST to REPOPAGES_URL with "files": [] and "pending": [{path, pageVersion, mrUrl,
+     mrState}] so the page shows the merge request link (--no-ack skips it; --mr none never acks).
+  --dry-run reads Confluence and git and prints what it would do; it pushes, opens and sends nothing.
+Confluence token: a classic API token (id.atlassian.com > Security > API tokens) or a scoped one with
+read:page:confluence, read:attachment:confluence and search:confluence. The site URL is tried first;
+on 401/403 (or always with --scoped-token) the client asks <site>/_edge/tenant_info for the cloud id
+and uses https://api.atlassian.com/ex/confluence/<cloudId>, which scoped tokens require.
+  CONFLUENCE_SITE        https://acme.atlassian.net                 (--confluence-site)
+  CONFLUENCE_EMAIL       the Atlassian account of the token         (--confluence-email)
+  CONFLUENCE_TOKEN       the API token                              (--confluence-token, --confluence-token-file)
+  CONFLUENCE_SPACE_KEY   only look in this space (optional)         (--space)
+  REPOPAGES_BASE         target branch (default: origin/HEAD, $CI_DEFAULT_BRANCH, the GitHub default branch, main) (--base)
+  REPOPAGES_GIT_AUTHOR   "Name <email>" of the commits              (default RepoPages <noreply@repopages.app>)
+  GITHUB_ACTIONS / GITLAB_CI select --mr github / gitlab by default; GH_TOKEN or GITHUB_TOKEN for gh;
+  GITLAB_TOKEN or CI_JOB_TOKEN, CI_API_V4_URL, CI_PROJECT_ID for GitLab.
+pull-edits exit codes: 0 done (malformed attachments are only WARNs); 1 Confluence could not be read;
+  2 configuration error (missing site, email, token, repo, or URL/secret when acknowledging; Confluence
+  answered 401/403); 3 the acknowledgement was rejected (any status but 200); 4 a branch could not be
+  pushed or a merge request could not be opened (wins over 3; the others are still acknowledged).
 
 Exit codes:
   0  every call returned 200 (or 207 with --allow-partial), or nothing to send
@@ -167,6 +208,8 @@ PLANTUML_SKINPARAMS = {
 
 # Shared HMAC test vector (same as test-vectors/push-v1.json here and in the RepoPages app repo).
 VECTOR_SIGNATURE = "sha256=a3a520cba8adb092cb92b524a75fe5bb995d276f23234d3540d8fdcb6a63fe0f"
+# Write-back acknowledgement vector (test-vectors/writeback-ack-v1.json, same file in the app repo).
+ACK_VECTOR_SIGNATURE = "sha256=732952646c1fa8cebab5ad754a7b0432b333dce465e2b7b7c3ef8f2a5cd7dae6"
 
 
 # ---------------------------------------------------------------- signing / HTTP
@@ -198,10 +241,11 @@ def send(url: str, secret: str, payload: dict, label: str) -> int:
         try:
             status, text = post(url, body, sign(secret, body))
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            print(f"{label}: {len(payload['files'])} files, {len(body)} bytes -> network error: {e}", flush=True)
+            print(f"{label}: {len(payload['files'])} files, {len(body)} bytes -> network error: {redact(str(e))}", flush=True)
             return 0
         took = time.monotonic() - t0
-        print(f"{label}: {len(payload['files'])} files, {len(body)} bytes -> HTTP {status} {text.strip()} ({took:.1f} s)", flush=True)
+        what = f"{len(payload['files'])} files" + (f", {len(payload['pending'])} pending" if "pending" in payload else "")
+        print(f"{label}: {what}, {len(body)} bytes -> HTTP {status} {text.strip()} ({took:.1f} s)", flush=True)
         if attempt == 1 and (status == 429 or status >= 500):
             print(f"{label}: retrying once in {RETRY_WAIT_S} s", flush=True)
             time.sleep(RETRY_WAIT_S)
@@ -812,6 +856,590 @@ class Git:
             return "refs/heads/main"
 
 
+# ---------------------------------------------------------------- pull-edits: Confluence edits -> merge requests
+
+PENDING_LABEL = "repopages-pending"
+PENDING_ATTACHMENT = "repopages-pending.md"
+PENDING_HEADER_START = "<!-- repopages-pending "
+PENDING_HEADER_END = " -->"
+MAX_PENDING = 100  # entries per acknowledgement call (the app's limit)
+DEFAULT_GIT_AUTHOR = "RepoPages <noreply@repopages.app>"
+NEEDS_ATTENTION = "needs-attention"
+SCOPED_API = "https://api.atlassian.com/ex/confluence/"
+CONFLUENCE_SCOPES = ("read:page:confluence", "read:attachment:confluence", "search:confluence")
+MR_KINDS = ("github", "gitlab", "none")
+SPACE_KEY_RE = re.compile(r"~?[A-Za-z0-9_-]{1,255}")
+HEX40_RE, HEX64_RE = re.compile(r"[0-9a-fA-F]{40}"), re.compile(r"[0-9a-fA-F]{64}")
+
+# Values that must never appear in output (tokens); filled at runtime, applied by redact().
+_SECRETS = []
+
+
+def register_secret(value: str):
+    if value and len(value) >= 6 and value not in _SECRETS:
+        _SECRETS.append(value)
+
+
+def redact(text: str) -> str:
+    for v in _SECRETS:
+        text = text.replace(v, "***")
+    return text
+
+
+class ProposalError(ValueError):
+    """repopages-pending.md is malformed (logged as WARN, the page is skipped)."""
+
+
+def one_line(v) -> str:
+    """A header string made safe for a commit trailer or a title: control characters become spaces."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(v)).strip()
+
+
+def safe_repo_path(path) -> bool:
+    """A relative Markdown path inside the repository: no "..", no leading "/", no backslash."""
+    if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path or "\0" in path:
+        return False
+    parts = path.split("/")
+    return all(p not in ("", ".", "..") for p in parts) and bool(MD_RE.search(path)) and parts[0] != ".git"
+
+
+def parse_proposal(text: str):
+    """Split repopages-pending.md into (header, markdown); ProposalError when anything is off.
+
+    Line 1 is exactly `<!-- repopages-pending {json} -->` (a trailing CR is tolerated), the Markdown is
+    everything after the first newline, and `proposalHash` must be the sha256 hex of its UTF-8 bytes.
+    The returned header has pageId as a string, version as an int and editorName always set.
+    """
+    if text.startswith("﻿"):
+        text = text[1:]
+    first, nl, markdown = text.partition("\n")
+    first = first[:-1] if first.endswith("\r") else first
+    if not nl:
+        raise ProposalError("no newline after the header line")
+    if not first.startswith(PENDING_HEADER_START) or not first.endswith(PENDING_HEADER_END) \
+            or len(first) <= len(PENDING_HEADER_START) + len(PENDING_HEADER_END):
+        raise ProposalError(f"first line is not '{PENDING_HEADER_START}{{...}}{PENDING_HEADER_END}'")
+    try:
+        h = json.loads(first[len(PENDING_HEADER_START):-len(PENDING_HEADER_END)])
+    except ValueError as e:
+        raise ProposalError(f"header is not JSON: {e}") from None
+    if not isinstance(h, dict):
+        raise ProposalError("header is not a JSON object")
+    for key in ("repo", "path", "baseSha", "pageId", "version", "proposalHash"):
+        if key not in h or h[key] in (None, ""):
+            raise ProposalError(f"header has no {key}")
+    if not isinstance(h["repo"], str) or not re.fullmatch(r"[^\s/]+(/[^\s/]+)+", h["repo"]):
+        raise ProposalError(f"repo {h['repo']!r} is not owner/name")
+    if not safe_repo_path(h["path"]):
+        raise ProposalError(f"path {h['path']!r} is not a relative Markdown path")
+    if not isinstance(h["baseSha"], str) or not HEX40_RE.fullmatch(h["baseSha"]):
+        raise ProposalError("baseSha is not a 40-character commit id")
+    page_id = str(h["pageId"]) if not isinstance(h["pageId"], bool) else ""
+    if not re.fullmatch(r"[0-9]{1,20}", page_id):
+        raise ProposalError(f"pageId {h['pageId']!r} is not a number")
+    if isinstance(h["version"], bool) or not isinstance(h["version"], int) or h["version"] < 1:
+        raise ProposalError(f"version {h['version']!r} is not a positive integer")
+    if not isinstance(h["proposalHash"], str) or not HEX64_RE.fullmatch(h["proposalHash"]):
+        raise ProposalError("proposalHash is not a sha256 hex digest")
+    actual = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    if actual != h["proposalHash"].lower():
+        raise ProposalError(f"proposalHash does not match the content (header {h['proposalHash'][:12]}..., "
+                            f"content {actual[:12]}...)")
+    out = dict(h)
+    out["pageId"], out["baseSha"] = page_id, h["baseSha"].lower()
+    out["editorName"] = one_line(h.get("editorName") or h.get("editor") or "someone") or "someone"
+    return out, markdown
+
+
+def same_repo(a: str, b: str) -> bool:
+    """GitHub and GitLab paths are case-insensitive."""
+    return a.strip().strip("/").lower() == b.strip().strip("/").lower()
+
+
+def edit_branch(prefix: str, page_id, version: int) -> str:
+    return f"{prefix.rstrip('-/')}-{page_id}-v{version}"
+
+
+def edit_date(at) -> str:
+    m = re.match(r"\d{4}-\d{2}-\d{2}", str(at or ""))
+    return m.group(0) if m else "an unknown date"
+
+
+def page_url(site: str, page_id) -> str:
+    return f"{site}/wiki/pages/viewpage.action?pageId={page_id}"
+
+
+def edit_title(h: dict) -> str:
+    return f"Confluence edit: {h['path']}"
+
+
+def commit_message(h: dict, site: str, note: str = "") -> str:
+    name = h["editorName"]
+    msg = (f"{edit_title(h)}\n\n"
+           f"Proposed in Confluence by {name} on {edit_date(h.get('at'))} (page {h['pageId']}, version {h['version']}).\n\n")
+    if note:
+        msg += note.strip() + "\n\n"
+    return msg + f"Edited-in-Confluence-by: {name}\nConfluence-page: {page_url(site, h['pageId'])}\n"
+
+
+def mr_body(h: dict, site: str, base: str, attention: str = "") -> str:
+    body = (f"{h['editorName']} edited [this Confluence page]({page_url(site, h['pageId'])}) on {edit_date(h.get('at'))} "
+            f"(version {h['version']}). RepoPages turned the edit into this change to `{h['path']}`, made against "
+            f"{h['baseSha'][:7]}.\n\n"
+            f"Merge it to accept the edit: the next push from `{base}` rewrites the page from Git and clears the "
+            "\"pending review\" mark. Until then the page shows the edit and links here.\n")
+    if attention:
+        body += f"\n**Needs attention:** {attention}\n"
+    return body + "\nOpened by the RepoPages CI client (`repopages_push.py pull-edits`).\n"
+
+
+def pending_cql(space: str = None) -> str:
+    cql = f'label = "{PENDING_LABEL}" and type = page'
+    return cql + (f' and space = "{space}"' if space else "")
+
+
+def pending_entry(h: dict, mr_url: str, state: str = "open") -> dict:
+    e = {"path": h["path"], "pageVersion": h["version"], "mrUrl": mr_url}
+    if state:
+        e["mrState"] = state
+    return e
+
+
+def ack_payloads(envelope: dict, entries) -> list:
+    """The acknowledgement calls: the push envelope, "files": [] and at most MAX_PENDING entries each."""
+    return [{**envelope, "files": [], "pending": entries[i:i + MAX_PENDING]} for i in range(0, len(entries), MAX_PENDING)]
+
+
+def normalize_site(site: str) -> str:
+    """'acme.atlassian.net', 'https://acme.atlassian.net/wiki/' -> 'https://acme.atlassian.net'."""
+    s = (site or "").strip().rstrip("/")
+    if not s:
+        return ""
+    if not re.match(r"https?://", s, re.I):
+        s = "https://" + s
+    s = re.sub(r"/wiki$", "", s)
+    return s.rstrip("/")
+
+
+def resolve_link(root: str, link: str) -> str:
+    """A Confluence `_links` value as a URL under root (the site, or the api.atlassian.com form).
+
+    Links come relative to the site ("/wiki/api/v2/..."), relative to the /wiki context
+    ("/rest/api/content/.../download", "/download/attachments/..."), or absolute with the site's host
+    (`_links.base` is always the site, even when the call went through api.atlassian.com). Absolute
+    URLs pointing at /wiki/ are rebased onto root; any other absolute URL is returned unchanged.
+    """
+    link = (link or "").strip()
+    if re.match(r"https?://", link, re.I):
+        if link.startswith(root + "/"):
+            return link
+        u = urllib.parse.urlsplit(link)
+        path = u.path + (f"?{u.query}" if u.query else "")
+        m = re.match(r"/ex/confluence/[^/]+(/wiki/.*)", u.path)
+        if m:
+            return root + m.group(1) + (f"?{u.query}" if u.query else "")
+        if u.path.startswith("/wiki/"):
+            return root + path
+        return link
+    if not link.startswith("/"):
+        link = "/" + link
+    if link.startswith("/wiki/"):
+        return root + link
+    return root + "/wiki" + link
+
+
+def parse_tenant_info(status: int, body: bytes) -> str:
+    """cloudId from `GET <site>/_edge/tenant_info`; ValueError with a reason otherwise."""
+    if status != 200:
+        raise ValueError(f"tenant_info answered HTTP {status}; is the site an Atlassian Cloud URL?")
+    try:
+        cid = json.loads(body.decode("utf-8")).get("cloudId")
+    except (ValueError, AttributeError):
+        raise ValueError("tenant_info did not return JSON") from None
+    if not isinstance(cid, str) or not re.fullmatch(r"[0-9a-fA-F-]{20,64}", cid):
+        raise ValueError("tenant_info has no cloudId")
+    return cid
+
+
+class _SameHostAuth(urllib.request.HTTPRedirectHandler):
+    """Follow redirects but drop the Authorization header when the host changes (attachment downloads
+    redirect to Atlassian's media service with a signed URL; Basic credentials stay on the site)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            for k in list(new.headers):
+                if k.lower() == "authorization":
+                    del new.headers[k]
+            for k in list(new.unredirected_hdrs):
+                if k.lower() == "authorization":
+                    del new.unredirected_hdrs[k]
+        return new
+
+
+def http_request(url: str, headers: dict, method: str = "GET", data: bytes = None):
+    """(status, body bytes). HTTP errors are returned, network errors raise OSError."""
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.build_opener(_SameHostAuth).open(req, timeout=TIMEOUT_S) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+class ConfluenceError(Exception):
+    def __init__(self, status: int, msg: str):
+        super().__init__(msg)
+        self.status = status
+
+
+class Confluence:
+    """Read-only Confluence REST client: Basic auth with an API token, classic or scoped."""
+
+    def __init__(self, site: str, email: str, token: str, scoped: bool = False, get=None, log=None):
+        self.site = normalize_site(site)
+        self.auth = "Basic " + base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
+        self.get = get or (lambda url, headers: http_request(url, headers))
+        self.log = log or say
+        self.root = self.site
+        self.scoped = False
+        self.switched = False  # tried the api.atlassian.com form already
+        self.answered = False  # some call succeeded: later 401/403 are about that resource, not the token
+        if scoped:
+            self.use_scoped()
+
+    def cloud_id(self) -> str:
+        try:
+            status, body = self.get(self.site + "/_edge/tenant_info", {"Accept": "application/json"})
+        except OSError as e:
+            raise ConfluenceError(0, f"{self.site}/_edge/tenant_info: {e}") from None
+        try:
+            return parse_tenant_info(status, body)
+        except ValueError as e:
+            raise ConfluenceError(status, f"{self.site}/_edge/tenant_info: {e}") from None
+
+    def use_scoped(self):
+        self.switched, self.scoped = True, True
+        self.root = SCOPED_API + self.cloud_id()
+
+    def fetch(self, link: str, accept: str = "application/json") -> bytes:
+        for _ in (1, 2):
+            url = resolve_link(self.root, link)
+            headers = {"Accept": accept}
+            if url.startswith(self.root + "/"):
+                headers["Authorization"] = self.auth
+            try:
+                status, body = self.get(url, headers)
+            except OSError as e:
+                raise ConfluenceError(0, f"{redact(url)}: network error: {redact(str(e))}") from None
+            if status in (401, 403) and not self.answered and not self.switched:
+                self.log(f"Confluence answered HTTP {status} on {self.site}; trying the scoped-token form "
+                         f"{SCOPED_API}<cloudId>")
+                self.use_scoped()
+                continue
+            if status != 200:
+                hint = ""
+                if status in (401, 403):
+                    hint = (" (check CONFLUENCE_EMAIL and CONFLUENCE_TOKEN; a scoped token needs "
+                            + ", ".join(CONFLUENCE_SCOPES) + ")")
+                raise ConfluenceError(status, f"GET {urllib.parse.urlsplit(url).path} -> HTTP {status}{hint}")
+            self.answered = True
+            return body
+        raise ConfluenceError(401, "unreachable")
+
+    def fetch_json(self, link: str) -> dict:
+        body = self.fetch(link)
+        try:
+            return json.loads(body.decode("utf-8"))
+        except ValueError:
+            raise ConfluenceError(200, f"{link.split('?')[0]}: not JSON") from None
+
+    def search_pending(self, space: str = None, limit: int = 50, max_pages: int = 40):
+        """[(page id, title)] of every page labelled repopages-pending, following `_links.next`."""
+        link = "/wiki/rest/api/search?" + urllib.parse.urlencode({"cql": pending_cql(space), "limit": limit})
+        out, seen = [], set()
+        for _ in range(max_pages):
+            d = self.fetch_json(link)
+            for r in d.get("results") or []:
+                c = r.get("content") or {}
+                pid = str(c.get("id") or "")
+                if pid and pid not in seen and c.get("type", "page") == "page":
+                    seen.add(pid)
+                    out.append((pid, c.get("title") or r.get("title") or ""))
+            link = (d.get("_links") or {}).get("next")
+            if not link or not d.get("results"):
+                break
+        return out
+
+    def pending_attachment(self, page_id: str):
+        """The bytes of the page's repopages-pending.md, or None when the page has none."""
+        link = f"/wiki/api/v2/pages/{page_id}/attachments?" + urllib.parse.urlencode({"filename": PENDING_ATTACHMENT, "limit": 50})
+        for _ in range(10):
+            d = self.fetch_json(link)
+            for att in d.get("results") or []:
+                if att.get("title") == PENDING_ATTACHMENT and att.get("status", "current") == "current":
+                    dl = att.get("downloadLink") or (att.get("_links") or {}).get("download")
+                    if not dl:
+                        raise ConfluenceError(200, f"page {page_id}: attachment without a download link")
+                    return self.fetch(dl, accept="*/*")
+            link = (d.get("_links") or {}).get("next")
+            if not link:
+                return None
+        return None
+
+
+# ---- git side
+
+class GitError(Exception):
+    pass
+
+
+def parse_author(value: str):
+    m = re.fullmatch(r"\s*([^<>]+?)\s*<([^<>\s]+@[^<>\s]+)>\s*", value or "")
+    if not m:
+        raise ValueError(f"{value!r} is not 'Name <email>'")
+    return m.group(1), m.group(2)
+
+
+def merge3_git(ours: str, base: str, theirs: str, labels=("git", "base", "Confluence")):
+    """`git merge-file -p`: (merged text, number of conflicts)."""
+    with tempfile.TemporaryDirectory(prefix="repopages-merge-") as d:
+        paths = []
+        for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
+            p = Path(d, name)
+            p.write_bytes(text.encode("utf-8"))
+            paths.append(str(p))
+        r = subprocess.run(["git", "merge-file", "-p", "-L", labels[0], "-L", labels[1], "-L", labels[2], *paths],
+                           capture_output=True)
+    if r.returncode < 0 or r.returncode > 127:
+        raise GitError(f"git merge-file failed: {r.stderr.decode('utf-8', 'replace').strip()}")
+    return r.stdout.decode("utf-8", "replace"), r.returncode
+
+
+def merge_proposal(ours, base, theirs: str, merge3=merge3_git, labels=("git", "base", "Confluence")):
+    """Fit the proposal onto the target branch. ours: the file on the target branch now (None: absent);
+    base: the file at baseSha (None: that commit is not available or did not have the file).
+    Returns (content, attention, note): attention is a reason for the needs-attention label or ""."""
+    if ours is not None and "\r\n" in ours and "\r\n" not in theirs:
+        theirs = theirs.replace("\n", "\r\n")  # keep the repository's line endings
+        base = base.replace("\n", "\r\n") if base is not None and "\r\n" not in base else base
+    if ours is None:
+        if base is not None:
+            return theirs, "the file was deleted in Git after the edit's base commit; this re-adds it", "file deleted in Git since"
+        return theirs, "", "new file"
+    if base is None:
+        return theirs, "", "base commit not available, proposal written as is"
+    if ours == base or ours == theirs:
+        return theirs, "", "clean"
+    merged, conflicts = merge3(ours, base, theirs, labels)
+    if conflicts:
+        return merged, (f"the file changed in Git after the edit's base commit and {conflicts} conflict(s) "
+                        "remain; resolve the conflict markers before merging"), f"merged, {conflicts} conflict(s)"
+    return merged, "", "merged onto newer Git changes"
+
+
+class EditRepo:
+    """The caller's checkout, used read-only except for a temporary worktree and pushes of new branches."""
+
+    def __init__(self, repo_dir: str, remote: str = "origin", push_url: str = None):
+        self.dir, self.remote, self.push_url = repo_dir, remote, push_url
+        self.run("rev-parse", "--git-dir")
+
+    def run(self, *args, cwd=None, env=None, input=None, check=True) -> str:
+        r = subprocess.run(["git", "-C", cwd or self.dir, *args], capture_output=True, input=input,
+                           env={**os.environ, **(env or {})})
+        if check and r.returncode:
+            raise GitError(redact(f"git {args[0]}: {r.stderr.decode('utf-8', 'replace').strip()}"))
+        return r.stdout.decode("utf-8", "replace")
+
+    def ok(self, *args) -> bool:
+        return subprocess.run(["git", "-C", self.dir, *args], capture_output=True).returncode == 0
+
+    def default_branch(self):
+        out = subprocess.run(["git", "-C", self.dir, "symbolic-ref", "-q", f"refs/remotes/{self.remote}/HEAD"],
+                             capture_output=True).stdout.decode().strip()
+        return out.rsplit(f"refs/remotes/{self.remote}/", 1)[-1] if out else None
+
+    def fetch(self, branch: str):
+        self.run("fetch", "--quiet", "--no-tags", self.remote, f"+refs/heads/{branch}:refs/remotes/{self.remote}/{branch}")
+
+    def base_ref(self, branch: str) -> str:
+        ref = f"refs/remotes/{self.remote}/{branch}"
+        return ref if self.ok("rev-parse", "--verify", "--quiet", ref + "^{commit}") else branch
+
+    def rev(self, ref: str) -> str:
+        return self.run("rev-parse", "--verify", ref + "^{commit}").strip()
+
+    def commit_time(self, sha: str) -> str:
+        return self.run("show", "-s", "--format=%cI", sha).strip()
+
+    def has_commit(self, sha: str) -> bool:
+        return self.ok("cat-file", "-e", sha + "^{commit}")
+
+    def show(self, rev: str, path: str):
+        r = subprocess.run(["git", "-C", self.dir, "show", f"{rev}:{path}"], capture_output=True)
+        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+
+    def remote_branch_exists(self, branch: str) -> bool:
+        target = self.push_url or self.remote
+        return bool(self.run("ls-remote", "--heads", target, f"refs/heads/{branch}").strip())
+
+    def commit_and_push(self, base_sha: str, branch: str, path: str, content: str, message: str, author, push=True) -> str:
+        """Commit `content` at `path` on top of base_sha in a temporary worktree and push it as a new branch
+        (never forced: an existing branch makes the push fail). Returns the commit id."""
+        tmp = tempfile.mkdtemp(prefix="repopages-edit-")
+        wt = os.path.join(tmp, "wt")
+        try:
+            self.run("worktree", "add", "--quiet", "--detach", wt, base_sha)
+            target = os.path.join(wt, *path.split("/"))
+            root = os.path.realpath(wt) + os.sep
+            existing = os.path.dirname(target)
+            while not os.path.exists(existing):
+                existing = os.path.dirname(existing)
+            if not (os.path.realpath(existing) + os.sep).startswith(root):
+                raise GitError(f"{path}: a folder on the way is a link out of the repository")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if os.path.islink(target) or not os.path.realpath(target).startswith(root):
+                raise GitError(f"{path}: is a symbolic link in the repository; not overwritten")
+            Path(target).write_bytes(content.encode("utf-8"))
+            self.run("add", "--", path, cwd=wt)
+            name, email = author
+            env = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
+            self.run("-c", "commit.gpgsign=false", "commit", "--quiet", "--no-verify", "-F", "-", cwd=wt, env=env,
+                     input=message.encode("utf-8"))
+            sha = self.run("rev-parse", "HEAD", cwd=wt).strip()
+            if push:
+                self.run("push", "--quiet", "--no-verify", self.push_url or self.remote, f"{sha}:refs/heads/{branch}", cwd=wt)
+            return sha
+        finally:
+            subprocess.run(["git", "-C", self.dir, "worktree", "remove", "--force", wt], capture_output=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+            subprocess.run(["git", "-C", self.dir, "worktree", "prune"], capture_output=True)
+
+
+# ---- merge request hosts
+
+class HostError(Exception):
+    pass
+
+
+GH_STATES = {"OPEN": "open", "MERGED": "merged", "CLOSED": "closed"}
+GL_STATES = {"opened": "open", "locked": "open", "merged": "merged", "closed": "closed"}
+
+
+class GitHubHost:
+    kind = "pull request"
+
+    def __init__(self, repo: str, run=None, env=None):
+        self.repo = repo
+        env = dict(os.environ if env is None else env)
+        if not env.get("GH_TOKEN") and env.get("GITHUB_TOKEN"):
+            env["GH_TOKEN"] = env["GITHUB_TOKEN"]
+        register_secret(env.get("GH_TOKEN", ""))
+        self.env = env
+        self._run = run or self._subprocess
+
+    def _subprocess(self, args):
+        try:
+            r = subprocess.run(["gh", *args], capture_output=True, env=self.env)
+        except FileNotFoundError:
+            raise HostError("the GitHub CLI `gh` is not installed (it is on GitHub-hosted runners)") from None
+        return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+    def gh(self, *args) -> str:
+        rc, out, err = self._run(list(args))
+        if rc:
+            raise HostError(redact(f"gh {args[0]} {args[1]}: {err.strip() or out.strip()}"))
+        return out
+
+    def find(self, branch: str):
+        out = self.gh("pr", "list", "--repo", self.repo, "--head", branch, "--state", "all", "--json", "url,state", "--limit", "1")
+        items = json.loads(out or "[]")
+        if not items:
+            return None
+        return items[0]["url"], GH_STATES.get(str(items[0].get("state", "")).upper(), "open")
+
+    def create(self, base: str, branch: str, title: str, body: str, labels=()) -> str:
+        out = self.gh("pr", "create", "--repo", self.repo, "--base", base, "--head", branch, "--title", title, "--body", body)
+        url = next((l.strip() for l in reversed(out.splitlines()) if l.strip().startswith("http")), "")
+        if not url:
+            raise HostError(f"gh pr create printed no URL: {out.strip()[:200]}")
+        for label in labels:
+            try:
+                self.gh("pr", "edit", url, "--add-label", label)
+            except HostError:
+                try:  # the label does not exist yet in this repository
+                    self.gh("label", "create", label, "--repo", self.repo, "--color", "D93F0B",
+                            "--description", "RepoPages: a Confluence edit with merge conflicts")
+                    self.gh("pr", "edit", url, "--add-label", label)
+                except HostError as e:
+                    say(f"WARN {url}: could not add the label {label}: {e}")
+        return url
+
+
+class GitLabHost:
+    kind = "merge request"
+
+    def __init__(self, repo: str, env=None, request=None):
+        env = os.environ if env is None else env
+        self.api = (env.get("CI_API_V4_URL") or (env.get("CI_SERVER_URL") or "https://gitlab.com").rstrip("/") + "/api/v4").rstrip("/")
+        self.project = env.get("CI_PROJECT_ID") or urllib.parse.quote(repo, safe="")
+        if env.get("GITLAB_TOKEN"):
+            self.headers = {"PRIVATE-TOKEN": env["GITLAB_TOKEN"]}
+        elif env.get("CI_JOB_TOKEN"):
+            self.headers = {"JOB-TOKEN": env["CI_JOB_TOKEN"]}
+        else:
+            self.headers = {}
+        for v in self.headers.values():
+            register_secret(v)
+        self.request = request or http_request
+
+    def call(self, method: str, path: str, payload=None):
+        headers = {"Accept": "application/json", **self.headers}
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+        try:
+            status, body = self.request(f"{self.api}/projects/{self.project}{path}", headers, method, data)
+        except OSError as e:
+            raise HostError(redact(f"GitLab API: {e}")) from None
+        if status not in (200, 201):
+            raise HostError(redact(f"GitLab API {method} {path.split('?')[0]} -> HTTP {status}: "
+                                   f"{body.decode('utf-8', 'replace')[:200]}"))
+        return json.loads(body.decode("utf-8"))
+
+    def find(self, branch: str):
+        items = self.call("GET", "/merge_requests?" + urllib.parse.urlencode({"source_branch": branch, "state": "all", "per_page": 1}))
+        if not items:
+            return None
+        return items[0]["web_url"], GL_STATES.get(items[0].get("state"), "open")
+
+    def create(self, base: str, branch: str, title: str, body: str, labels=()) -> str:
+        payload = {"source_branch": branch, "target_branch": base, "title": title, "description": body,
+                   "remove_source_branch": True}
+        if labels:
+            payload["labels"] = ",".join(labels)
+        return self.call("POST", "/merge_requests", payload)["web_url"]
+
+
+def gitlab_push_url(env) -> str:
+    """With GITLAB_TOKEN in GitLab CI, push over HTTPS with that token (CI_JOB_TOKEN usually cannot push)."""
+    tok, server, path = env.get("GITLAB_TOKEN"), env.get("CI_SERVER_URL"), env.get("CI_PROJECT_PATH")
+    if not (tok and server and path):
+        return None
+    u = urllib.parse.urlsplit(server)
+    return f"{u.scheme}://oauth2:{urllib.parse.quote(tok, safe='')}@{u.netloc}{u.path.rstrip('/')}/{path}.git"
+
+
+def default_mr(env) -> str:
+    if env.get("GITHUB_ACTIONS"):
+        return "github"
+    if env.get("GITLAB_CI"):
+        return "gitlab"
+    return "none"
+
+
 # ---------------------------------------------------------------- commands
 
 def config_error(msg: str):
@@ -819,14 +1447,15 @@ def config_error(msg: str):
     sys.exit(2)
 
 
-def setup(a):
+def sync_target(a, required: bool):
+    """(url, secret) from --url/--secret-file or REPOPAGES_URL/REPOPAGES_SECRET; exit 2 when required and missing."""
     url = a.url or os.environ.get("REPOPAGES_URL")
     if a.secret_file:
         secret = Path(a.secret_file).expanduser().read_text("utf-8").strip()
     else:
         # Pasted values often carry a trailing newline; the secret is hex, so trimming is always safe.
         secret = os.environ.get("REPOPAGES_SECRET", "").strip()
-    if not a.dry_run and (not url or not secret):
+    if required and (not url or not secret):
         config_error("REPOPAGES_URL and REPOPAGES_SECRET (or --url / --secret-file) are required")
     if secret and not re.fullmatch(r"[0-9a-f]{64}", secret):
         print(f"WARN REPOPAGES_SECRET is {len(secret)} characters, not the 64 hex characters RepoPages generates; "
@@ -837,6 +1466,11 @@ def setup(a):
         if not url.startswith("https://"):
             config_error("REPOPAGES_URL must be the sync URL from the RepoPages settings page (it starts with https://); "
                          f"got a value of {len(url)} characters that does not")
+    return url, secret
+
+
+def setup(a):
+    url, secret = sync_target(a, not a.dry_run)
     git = Git(a.repo_dir, a.rev)
     repo = a.repo or os.environ.get("GITHUB_REPOSITORY")
     if not repo:
@@ -954,6 +1588,219 @@ def cmd_push(a) -> int:
         return 2
     rc, partial = run_pass("push", files, envelope, url, secret, a.dry_run, a.max_files, a.max_bytes)
     return rc or partial_result(partial, a.allow_partial)
+
+
+def confluence_token(a) -> str:
+    if a.confluence_token_file:
+        return Path(a.confluence_token_file).expanduser().read_text("utf-8").strip()
+    return (a.confluence_token or os.environ.get("CONFLUENCE_TOKEN", "")).strip()
+
+
+def detect_base(a, git, mr: str, repo: str, env) -> str:
+    if a.base or env.get("REPOPAGES_BASE"):
+        return (a.base or env["REPOPAGES_BASE"]).strip()
+    b = git.default_branch() if git else None
+    if b:
+        return b
+    if env.get("CI_DEFAULT_BRANCH"):
+        return env["CI_DEFAULT_BRANCH"]
+    if mr == "github":
+        try:
+            out = GitHubHost(repo, env=env).gh("repo", "view", repo, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name")
+            if out.strip():
+                return out.strip()
+        except HostError:
+            pass
+    return "main"
+
+
+def cmd_pull_edits(a) -> int:
+    env = os.environ
+    site = normalize_site(a.confluence_site or env.get("CONFLUENCE_SITE", ""))
+    email = (a.confluence_email or env.get("CONFLUENCE_EMAIL", "")).strip()
+    token = confluence_token(a)
+    register_secret(token)
+    if not site or not email or not token:
+        config_error("CONFLUENCE_SITE, CONFLUENCE_EMAIL and CONFLUENCE_TOKEN (or --confluence-site, --confluence-email, "
+                     "--confluence-token / --confluence-token-file) are required")
+    repo = a.repo or env.get("GITHUB_REPOSITORY")
+    if not repo:
+        config_error("--repo (or GITHUB_REPOSITORY) is required")
+    space = (a.space if a.space is not None else env.get("CONFLUENCE_SPACE_KEY", "")).strip() or None
+    if space and not SPACE_KEY_RE.fullmatch(space):
+        config_error(f"--space {space!r} is not a Confluence space key")
+    mr = a.mr or default_mr(env)
+    try:
+        author = parse_author(env.get("REPOPAGES_GIT_AUTHOR") or DEFAULT_GIT_AUTHOR)
+    except ValueError as e:
+        config_error(f"REPOPAGES_GIT_AUTHOR: {e}")
+    ack = not a.dry_run and not a.no_ack and mr != "none"
+    url, secret = sync_target(a, ack) if ack else (None, None)
+    if secret:
+        register_secret(secret)
+
+    push_url = gitlab_push_url(env) if mr == "gitlab" else None
+    if push_url:
+        register_secret(push_url)
+    try:
+        git = EditRepo(a.repo_dir, push_url=push_url)
+    except (GitError, FileNotFoundError) as e:
+        if not a.dry_run:
+            config_error(f"--repo-dir {a.repo_dir} is not a git checkout: {e}")
+        say(f"WARN {a.repo_dir} is not a git checkout; the dry run cannot check branches or merges")
+        git = None
+    base = detect_base(a, git, mr, repo, env)
+    host = GitHubHost(repo, env=env) if mr == "github" else GitLabHost(repo, env=env) if mr == "gitlab" else None
+
+    conf = Confluence(site, email, token, scoped=a.scoped_token)
+    try:
+        pages = conf.search_pending(space)
+    except ConfluenceError as e:
+        print(f"ERROR Confluence: {redact(str(e))}", file=sys.stderr, flush=True)
+        return 2 if e.status in (401, 403) else 1
+    where = f" in space {space}" if space else ""
+    say(f"pull-edits {repo}: {len(pages)} page(s) labelled {PENDING_LABEL}{where} on {site}"
+        + (" (scoped token)" if conf.scoped else "") + f"; base branch {base}" + (", dry run" if a.dry_run else ""))
+    if not pages:
+        return 0
+
+    base_ref = base
+    if git:
+        if not a.dry_run:
+            try:
+                git.fetch(base)
+            except GitError as e:
+                print(f"ERROR {e}", file=sys.stderr, flush=True)
+                return 2
+        base_ref = git.base_ref(base)
+        try:
+            base_sha = git.rev(base_ref)
+        except GitError as e:
+            if not a.dry_run:
+                print(f"ERROR base branch {base}: {e}", file=sys.stderr, flush=True)
+                return 2
+            say(f"WARN base branch {base} is not in {a.repo_dir}; merges are not checked")
+            git = None
+
+    entries, mr_failed, warnings = [], 0, 0
+    for page_id, title in sorted(pages, key=lambda p: int(p[0]) if p[0].isdigit() else 0):
+        tag = f'page {page_id} "{title}"'
+        try:
+            raw = conf.pending_attachment(page_id)
+        except ConfluenceError as e:
+            say(f"WARN {tag}: {redact(str(e))}; skipped")
+            warnings += 1
+            continue
+        if raw is None:
+            say(f"{tag}: pending, but no {PENDING_ATTACHMENT} (the edit could not be turned into Markdown); skipped")
+            continue
+        try:
+            h, proposal = parse_proposal(raw.decode("utf-8"))
+            if h["pageId"] != page_id:
+                raise ProposalError(f"header pageId {h['pageId']} is not this page")
+        except (ProposalError, UnicodeDecodeError) as e:
+            say(f"WARN {tag}: {PENDING_ATTACHMENT} is malformed: {e}; skipped")
+            warnings += 1
+            continue
+        if not same_repo(h["repo"], repo):
+            say(f"{tag}: proposal for {h['repo']}, not {repo}; skipped")
+            continue
+        branch = edit_branch(a.branch_prefix, page_id, h["version"])
+        what = f"{tag}: {h['path']} v{h['version']} by {h['editorName']} ({edit_date(h.get('at'))}, base {h['baseSha'][:7]})"
+        try:
+            exists = git.remote_branch_exists(branch) if git else False
+        except GitError as e:
+            say(f"{'WARN' if a.dry_run else 'ERROR'} {what}: cannot list the branches on origin: {e}")
+            warnings += a.dry_run
+            mr_failed += not a.dry_run
+            continue
+        if exists:
+            found = None
+            if host:
+                try:
+                    found = host.find(branch)
+                except HostError as e:
+                    say(f"WARN {what}: {branch} exists; looking up its {host.kind} failed: {e}")
+                    warnings += 1
+                    continue
+            if found:
+                entries.append(pending_entry(h, found[0], found[1]))
+                say(f"{what}: already proposed on {branch}: {found[0]} ({found[1]})")
+            elif not host:
+                say(f"{what}: {branch} exists (--mr none: merge requests are not looked up); skipped")
+            elif a.dry_run:
+                say(f"{what}: {branch} exists without a {host.kind}; would open '{edit_title(h)}' into {base}")
+            else:
+                # An earlier run pushed the branch but could not open the merge request: open it now.
+                try:
+                    mr_url = host.create(base, branch, edit_title(h), mr_body(h, site, base), [])
+                except HostError as e:
+                    say(f"ERROR {what}: {branch} exists but the {host.kind} could not be opened: {e}")
+                    mr_failed += 1
+                    continue
+                entries.append(pending_entry(h, mr_url, "open"))
+                say(f"{what}: opened {mr_url} from the existing {branch}")
+            continue
+
+        if git:
+            ours = git.show(base_ref, h["path"])
+            orig = git.show(h["baseSha"], h["path"]) if git.has_commit(h["baseSha"]) else None
+            try:
+                content, attention, note = merge_proposal(ours, orig, proposal,
+                                                          labels=(f"{base} (Git)", f"{h['baseSha'][:7]} (edit's base)", "Confluence"))
+            except GitError as e:
+                say(f"ERROR {what}: {e}")
+                mr_failed += 1
+                continue
+            if ours is not None and content == ours:
+                say(f"{what}: {base} already has this content; nothing to propose")
+                continue
+        else:
+            content, attention, note = proposal, "", "not checked"
+        labels = [NEEDS_ATTENTION] if attention else []
+        kind = host.kind if host else "merge request"
+        if a.dry_run:
+            say(f"{what}: would push {branch} ({note}) and open the {kind} '{edit_title(h)}' into {base}"
+                + (f" with label {NEEDS_ATTENTION}" if labels else "") + (" (--mr none: not opened)" if not host else ""))
+            continue
+        message = commit_message(h, site, f"Needs attention: {attention}." if attention else "")
+        try:
+            git.commit_and_push(base_sha, branch, h["path"], content, message, author)
+        except GitError as e:
+            say(f"ERROR {what}: could not push {branch}: {e}")
+            mr_failed += 1
+            continue
+        if not host:
+            say(f"{what}: pushed {branch} ({note}); --mr none: open a merge request {branch} -> {base} titled "
+                f"'{edit_title(h)}'" + (f" with label {NEEDS_ATTENTION}" if labels else ""))
+            continue
+        try:
+            mr_url = host.create(base, branch, edit_title(h), mr_body(h, site, base, attention), labels)
+        except HostError as e:
+            say(f"ERROR {what}: pushed {branch} but could not open the {kind}: {e}")
+            mr_failed += 1
+            continue
+        entries.append(pending_entry(h, mr_url, "open"))
+        say(f"{what}: opened {mr_url} from {branch} ({note})" + (f", label {NEEDS_ATTENTION}" if labels else ""))
+
+    rc = 0
+    if entries and ack:
+        server = env.get("GITHUB_SERVER_URL", "https://github.com")
+        envelope = {"repo": repo, "ref": f"refs/heads/{base}", "sha": base_sha, "shortSha": base_sha[:7],
+                    "commitUrl": f"{server}/{repo}/commit/{base_sha}", "pushedAt": git.commit_time(base_sha)}
+        calls = ack_payloads(envelope, entries)
+        for n, payload in enumerate(calls, 1):
+            status = send(url, secret, payload, f"ack {n}/{len(calls)}")
+            if status != 200:
+                print(f"ERROR the acknowledgement was not accepted (HTTP {status or 'network error'}); the pages keep "
+                      "showing 'pending review' without the link. Check REPOPAGES_URL and REPOPAGES_SECRET.",
+                      file=sys.stderr, flush=True)
+                rc = 3
+    elif entries and not a.dry_run:
+        say(f"ack skipped ({'--no-ack' if a.no_ack else '--mr none'}): {len(entries)} merge request(s) not reported")
+    if warnings:
+        print(f"WARN {warnings} page(s) skipped with a warning (see above)", file=sys.stderr, flush=True)
+    return 4 if mr_failed else rc
 
 
 def strip_force(f: dict) -> dict:
@@ -1272,12 +2119,63 @@ def cmd_selftest(_a) -> int:
     finally:
         post = real_post
     assert ap.parse_args(["push"]).allow_partial is False and ap.parse_args(["import", "--allow-partial"]).allow_partial is True
+
+    # 11. pull-edits: the repopages-pending.md header parser.
+    md = "# Reply drafter — Grüße\n\nBe brief.\n"
+    hdr = {"repo": "owner/name", "path": "docs/prompts/x.md", "baseSha": "ab" * 20, "pageId": "123", "version": 17,
+           "editor": "557058:abc", "editorName": "Ana Kovač", "at": "2026-10-09T08:00:00Z",
+           "proposalHash": hashlib.sha256(md.encode("utf-8")).hexdigest()}
+    att = lambda h, body=md: f"{PENDING_HEADER_START}{json.dumps(h, ensure_ascii=False)}{PENDING_HEADER_END}\n{body}"
+    h, got = parse_proposal(att(hdr))
+    assert got == md and h["pageId"] == "123" and h["version"] == 17 and h["editorName"] == "Ana Kovač", h
+    assert same_repo(h["repo"], "Owner/Name") and not same_repo(h["repo"], "owner/other")  # other repo: skipped by the caller
+    for bad, why in (({k: v for k, v in hdr.items() if k != "proposalHash"}, "no proposalHash"),
+                     ({**hdr, "proposalHash": "0" * 64}, "does not match"),
+                     ({**hdr, "path": "../etc/passwd.md"}, "relative Markdown path"),
+                     ({**hdr, "version": "17"}, "positive integer")):
+        try:
+            parse_proposal(att(bad))
+            raise AssertionError(f"accepted: {why}")
+        except ProposalError as e:
+            assert why in str(e), (why, str(e))
+    for broken in ("<!-- repopages-pending {} -->", "# no header\n" + md, "<!-- repopages-pending {nope} -->\n" + md):
+        try:
+            parse_proposal(broken)
+            raise AssertionError(f"accepted: {broken!r}")
+        except ProposalError:
+            pass
+    assert edit_branch("repopages/edit", "123", 17) == "repopages/edit-123-v17"
+    assert pending_cql() == 'label = "repopages-pending" and type = page'
+    assert pending_cql("DOCS") == 'label = "repopages-pending" and type = page and space = "DOCS"'
+
+    # 12. The acknowledgement payload and its shared vector (embedded, and the file when present).
+    ack_env = {"repo": "owner/name", "ref": "refs/heads/main", "sha": "0123456789abcdef0123456789abcdef01234567",
+               "shortSha": "0123456", "commitUrl": "https://github.com/owner/name/commit/0123456789abcdef0123456789abcdef01234567",
+               "pushedAt": "2026-10-09T10:00:00+00:00"}
+    [ack] = ack_payloads(ack_env, [
+        pending_entry({"path": "docs/prompts/support-reply-drafter.md", "version": 17}, "https://github.com/owner/name/pull/42", "open"),
+        pending_entry({"path": "docs/café.md", "version": 5}, "https://github.com/owner/name/pull/41", "closed")])
+    assert sign("0123456789abcdef" * 4, encode(ack)) == ACK_VECTOR_SIGNATURE, "ack payload: encode()+sign() mismatch"
+    ack_path = here.parent / "test-vectors" / "writeback-ack-v1.json"
+    if ack_path.is_file():
+        v = json.loads(ack_path.read_text("utf-8"))
+        assert sign(v["secret"], v["body"].encode("utf-8")) == v["signature"] == ACK_VECTOR_SIGNATURE, "ack vector mismatch"
+        assert v["body"].encode("utf-8") == encode(ack), "ack vector body differs from ack_payloads()"
+        print(f"ack vector ok ({ack_path})")
+    many = ack_payloads(ack_env, [{"path": f"d/{i}.md", "pageVersion": 1, "mrUrl": "u"} for i in range(205)])
+    assert [len(c["pending"]) for c in many] == [100, 100, 5] and all(c["files"] == [] for c in many)
+    assert ap.parse_args(["pull-edits"]).branch_prefix == "repopages/edit" and ap.parse_args(["pull-edits", "--mr", "gitlab"]).mr == "gitlab"
     print("selftest ok")
     return 0
 
 
 EXIT_CODES = ("Exit codes: 0 ok; 1 a call failed (stopped); 2 configuration or renderer error, nothing sent; "
               "3 some chunk returned 207 partial (0 with --allow-partial).")
+
+
+PULL_EDITS_EXIT_CODES = ("Exit codes: 0 done (malformed attachments are WARNs); 1 Confluence could not be read; "
+                         "2 configuration error or Confluence answered 401/403; 3 the acknowledgement was rejected; "
+                         "4 a branch could not be pushed or a merge request could not be opened.")
 
 
 def build_parser():
@@ -1324,6 +2222,28 @@ def build_parser():
             p.add_argument("--force", action="store_true", help="rewrite the pages even if unchanged")
             p.add_argument("paths", nargs="*", metavar="PATH",
                            help="send only these repo paths (also when the commit did not change them)")
+    p = sub.add_parser("pull-edits", epilog=PULL_EDITS_EXIT_CODES,
+                       help="open merge requests for edits made in Confluence (pages labelled repopages-pending)")
+    p.add_argument("--confluence-site", help="https://acme.atlassian.net (default: $CONFLUENCE_SITE)")
+    p.add_argument("--confluence-email", help="the token's Atlassian account (default: $CONFLUENCE_EMAIL)")
+    p.add_argument("--confluence-token", help="API token (default: $CONFLUENCE_TOKEN); prefer the variable or --confluence-token-file")
+    p.add_argument("--confluence-token-file", help="read the API token from this file")
+    p.add_argument("--scoped-token", action="store_true",
+                   help="the token is a scoped API token: call api.atlassian.com/ex/confluence/<cloudId> directly "
+                        "(otherwise tried after a 401/403 from the site)")
+    p.add_argument("--space", help="only pages in this space key (default: $CONFLUENCE_SPACE_KEY, else every space)")
+    p.add_argument("--repo", help="owner/name as mapped in RepoPages (default: $GITHUB_REPOSITORY)")
+    p.add_argument("--repo-dir", default=".", help="git checkout with an 'origin' remote (default: .)")
+    p.add_argument("--url", help="sync trigger URL for the acknowledgement (default: $REPOPAGES_URL)")
+    p.add_argument("--secret-file", help="read the secret from this file (default: $REPOPAGES_SECRET)")
+    p.add_argument("--branch-prefix", default="repopages/edit", help="branch names: PREFIX-<pageId>-v<version> (default: repopages/edit)")
+    p.add_argument("--base", help="target branch (default: $REPOPAGES_BASE, origin/HEAD, $CI_DEFAULT_BRANCH, "
+                                  "the GitHub default branch, else main)")
+    p.add_argument("--mr", choices=MR_KINDS,
+                   help="how to open merge requests (default: github when $GITHUB_ACTIONS is set, gitlab when $GITLAB_CI "
+                        "is set, else none: push the branch only and print the request to open)")
+    p.add_argument("--no-ack", action="store_true", help="do not report the merge requests to RepoPages")
+    p.add_argument("--dry-run", action="store_true", help="read Confluence and git, print what would happen; push, open and send nothing")
     sub.add_parser("selftest")
     return ap
 
@@ -1333,7 +2253,7 @@ def main():
     a = ap.parse_args()
     if hasattr(a, "max_bytes") and not 1024 <= a.max_bytes <= MAX_BYTES:
         ap.error(f"--max-bytes must be between 1024 and {MAX_BYTES}")
-    sys.exit({"push": cmd_push, "import": cmd_import, "selftest": cmd_selftest}[a.cmd](a))
+    sys.exit({"push": cmd_push, "import": cmd_import, "pull-edits": cmd_pull_edits, "selftest": cmd_selftest}[a.cmd](a))
 
 
 if __name__ == "__main__":
