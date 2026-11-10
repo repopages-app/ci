@@ -331,7 +331,12 @@ def payload_size(envelope: dict, files) -> int:
 
 
 def strip_images(f: dict) -> dict:
-    return {k: v for k, v in f.items() if k not in ("diagrams", "images")}
+    """The file without its diagrams and images; the dropped images are reported as too-large-page."""
+    out = {k: v for k, v in f.items() if k not in ("diagrams", "images")}
+    dropped = [{"src": i["path"][:1000], "reason": "too-large-page"} for i in f.get("images") or []]
+    if dropped:
+        out["imagesSkipped"] = ((f.get("imagesSkipped") or []) + dropped)[:500]
+    return out
 
 
 def image_count(f: dict) -> int:
@@ -573,10 +578,11 @@ def image_problem(data: bytes):
 
 
 def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=None):
-    """The `images` entries for one Markdown file: each local image it uses that exists at REV, once.
-    An image that is missing or that the app would reject is logged and left out (the page shows a note)."""
+    """(images, skipped) for one Markdown file: each local image it uses that exists at REV, once;
+    and the ones left out (missing, or rejected by the app's rules: logged, the page shows a note),
+    as `imagesSkipped` entries {src, reason} so the app can report them to the vendor."""
     log = log or say
-    out, seen = [], set()
+    out, seen, skipped = [], set(), []
     for src in image_srcs(content):
         cands = image_candidates(path, src, prefix)
         if not cands:
@@ -584,6 +590,7 @@ def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=Non
         found = next((c for c in cands if exists(c)), None)
         if not found:
             log(f"WARN {path}: image not found: {src}")
+            skipped.append({"src": src[:1000], "reason": "missing"})
             continue
         if found in seen:
             continue
@@ -591,9 +598,10 @@ def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=Non
         data, problem = image_problem(read_bytes(found))
         if problem:
             log(f"WARN {path}: image {found} {problem}; not sent")
+            skipped.append({"src": found[:1000], "reason": "too-large-image" if "byte limit" in problem else "unsupported"})
             continue
         out.append({"path": found, "hash": hashlib.sha256(data).hexdigest(), "data": base64.b64encode(data).decode("ascii")})
-    return out
+    return out, skipped
 
 
 def add_images(files, git, prefix: str, mode: str = "on"):
@@ -607,10 +615,12 @@ def add_images(files, git, prefix: str, mode: str = "on"):
             continue
         if tree is None:
             tree = set(git.tree_files())
-        imgs = images_for(f["path"], content, prefix, tree.__contains__, git.read_bytes)
+        imgs, skipped = images_for(f["path"], content, prefix, tree.__contains__, git.read_bytes)
         if imgs:
             f["images"] = imgs
             total += len(imgs)
+        if skipped:
+            f["imagesSkipped"] = skipped[:500]
     if total:
         print(f"images: {total} local image(s) attached", flush=True)
     return total
@@ -2137,8 +2147,9 @@ def cmd_selftest(_a) -> int:
     assert "byte limit" in image_problem(b"\x89PNG\r\n\x1a\n" + b"0" * MAX_IMAGE_BYTES)[1]
     repo_files = {"docs/img/a.png": png1, "docs/img/bad.pdf.png": b"%PDF", "docs/s.svg": b"<svg xmlns='x'/>"}
     logs = []
-    got = images_for("docs/p.md", "![a](img/a.png) ![again](./img/a.png) ![b](img/bad.pdf.png) ![c](missing.png) "
-                     "![r](https://e.com/x.png) <img src='s.svg'>", "docs/", repo_files.__contains__, repo_files.__getitem__, logs.append)
+    got, skipped = images_for("docs/p.md", "![a](img/a.png) ![again](./img/a.png) ![b](img/bad.pdf.png) ![c](missing.png) "
+                              "![r](https://e.com/x.png) <img src='s.svg'>", "docs/", repo_files.__contains__, repo_files.__getitem__, logs.append)
+    assert skipped == [{"src": "docs/img/bad.pdf.png", "reason": "unsupported"}, {"src": "missing.png", "reason": "missing"}], skipped
     assert [i["path"] for i in got] == ["docs/img/a.png", "docs/s.svg"], got
     assert got[0]["hash"] == hashlib.sha256(png1).hexdigest() and base64.b64decode(got[0]["data"]) == png1
     assert logs == ["WARN docs/p.md: image docs/img/bad.pdf.png is not a PNG, JPEG, GIF, WebP or SVG image; not sent",
@@ -2149,6 +2160,7 @@ def cmd_selftest(_a) -> int:
     logs = []
     cs = chunk([big], {"repo": "o/r", "files": []}, max_bytes=5000, log=logs.append)
     assert "images" not in cs[0][0] and "as notes" in logs[0], logs
+    assert cs[0][0]["imagesSkipped"] == [{"src": "a.png", "reason": "too-large-page"}], cs[0][0]
 
     # 6b. Code includes.
     repo = {"docs_src/app.py": "a = 1\nb = 2\nc = 3\nd = 4\n", "docs/en/docs/x/data.json": '{"k": "```"}\n'}
