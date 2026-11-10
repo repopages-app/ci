@@ -24,6 +24,14 @@ Both push and import read file content from git at REV (default HEAD), not from 
 split files into chunks (max 15 files and max 4 MB of UTF-8 JSON per call, images included), POST the chunks one
 after another, retry once after 5 s on HTTP 429/5xx, and stop at the first other failure.
 
+Images (--images on, the default): local images the Markdown uses (`![alt](img/a.png)`, reference
+images, `<img src>`; resolved like the app resolves them: relative to the file, "/..." against the repo
+root and then --prefix) are read from REV and sent as the file's `images`. PNG, JPEG, GIF, WebP and SVG
+(no <script>), at most 2 MiB each; one that is missing or not accepted is logged as
+`WARN <file>: image ...` and the page shows a note. `push` also re-sends the pages that use an image
+the commit added, changed, renamed or deleted, so they pick up the new image. Remote https:// images
+are embedded by URL by the app and not sent.
+
 Diagrams (--render auto, the default): every ```mermaid and ```plantuml block is rendered and sent
 as the file's `diagrams`; the app embeds the image and keeps the source in a "Diagram source"
 expand. Format: --diagram-format svg (default; sharp at any zoom and in PDF export, labels as plain
@@ -112,6 +120,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -322,7 +331,11 @@ def payload_size(envelope: dict, files) -> int:
 
 
 def strip_images(f: dict) -> dict:
-    return {k: v for k, v in f.items() if k != "diagrams"}
+    return {k: v for k, v in f.items() if k not in ("diagrams", "images")}
+
+
+def image_count(f: dict) -> int:
+    return len(f.get("diagrams") or []) + len(f.get("images") or [])
 
 
 def chunk(files, envelope: dict, max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES, log=None):
@@ -337,9 +350,9 @@ def chunk(files, envelope: dict, max_files: int = MAX_FILES, max_bytes: int = MA
     chunks, cur, cur_bytes = [], [], base
     for f in files:
         size = len(encode(f))
-        if base + size > max_bytes and f.get("diagrams"):
-            log(f"WARN {f['path']}: {base + size} bytes with {len(f['diagrams'])} image(s) exceeds {max_bytes} "
-                "even alone; sending its diagrams as code")
+        if base + size > max_bytes and image_count(f):
+            log(f"WARN {f['path']}: {base + size} bytes with {image_count(f)} image(s) exceeds {max_bytes} "
+                "even alone; sending its diagrams as code and its images as notes")
             f = strip_images(f)
             size = len(encode(f))
         if base + size > max_bytes:
@@ -458,6 +471,184 @@ def add_includes(files, git, mode: str = "on"):
             total += n
     if total:
         print(f"includes: {total} code include(s) inlined", flush=True)
+
+
+# ---------------------------------------------------------------- local images
+
+IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)$", re.I)
+MD_IMAGE_RE = re.compile(r"!\[(?:[^\]\\]|\\.)*\]\(\s*(<[^>\n]*>|[^)\s]+)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)")
+REF_IMAGE_RE = re.compile(r"!\[((?:[^\]\\]|\\.)*)\](?:\[([^\]]*)\])?(?![(\[:])")
+REF_DEF_RE = re.compile(r"^[ ]{0,3}\[((?:[^\]\\]|\\.)+)\]:[ \t]*(<[^>\n]*>|\S+)", re.M)
+HTML_IMG_RE = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.I)
+INLINE_CODE_RE = re.compile(r"`+[^`\n]*`+")
+
+
+def resolve_relative(from_path: str, href: str):
+    """The app's resolveRelative: href against from_path's folder ("/..." against the repo root);
+    None when ".." climbs out of the repo."""
+    parts = [] if href.startswith("/") else [p for p in from_path.split("/")[:-1] if p]
+    for seg in href.lstrip("/").split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(seg)
+    return "/".join(parts)
+
+
+def image_candidates(from_path: str, src: str, site_root: str = ""):
+    """The app's imagePaths: repo paths a local image src may point to, in lookup order. Relative to
+    the Markdown file's folder; "/..." against the repo root, then site_root (the mapping prefix).
+    Query and fragment are dropped, %-escapes decoded. Remote, protocol-relative and data URLs: none."""
+    if not src or src.startswith("//") or re.match(r"^[a-z][a-z0-9+.-]*:", src, re.I):
+        return []
+    target = src.split("#", 1)[0].split("?", 1)[0]
+    try:
+        target = urllib.parse.unquote(target, errors="strict")
+    except UnicodeDecodeError:
+        pass
+    if not target:
+        return []
+    out = [resolve_relative(from_path, target)]
+    if target.startswith("/") and site_root:
+        out.append(resolve_relative(site_root.rstrip("/") + "/_", target.lstrip("/")))
+    return list(dict.fromkeys(p for p in out if p))
+
+
+def image_srcs(markdown: str):
+    """Image sources the Markdown uses, in document order, once each: inline `![](src)`, reference
+    `![alt][id]` / `![id]` with `[id]: src`, and HTML `<img src>`. Fenced code and inline code are skipped."""
+    lines, kept, fence = markdown.replace("\r\n", "\n").split("\n"), [], None
+    for line in lines:
+        fm = FENCE_RE.match(line.lstrip(" "))
+        if fence:
+            if fm and fm.group(1)[0] == fence[0] and len(fm.group(1)) >= len(fence) and not fm.group(2).strip():
+                fence = None
+            continue
+        if fm and not (fm.group(1)[0] == "`" and "`" in fm.group(2)):
+            fence = fm.group(1)
+            continue
+        kept.append(INLINE_CODE_RE.sub("", line))
+    text = "\n".join(kept)
+    defs = {}
+    for m in REF_DEF_RE.finditer(text):
+        defs.setdefault(re.sub(r"\s+", " ", m.group(1)).strip().lower(), m.group(2).strip("<>"))
+    found = []
+    for m in MD_IMAGE_RE.finditer(text):
+        found.append((m.start(), m.group(1).strip("<>")))
+    inline_spans = [m.span() for m in MD_IMAGE_RE.finditer(text)]
+    for m in REF_IMAGE_RE.finditer(text):
+        if any(a <= m.start() < b for a, b in inline_spans):
+            continue
+        label = re.sub(r"\s+", " ", (m.group(2) or m.group(1))).strip().lower()
+        if label in defs:
+            found.append((m.start(), defs[label]))
+    for m in HTML_IMG_RE.finditer(text):
+        found.append((m.start(), html.unescape(m.group(1).strip("\"'"))))
+    return list(dict.fromkeys(src for _, src in sorted(found)))
+
+
+def image_problem(data: bytes):
+    """(bytes to send, None) when the app accepts this image, else (None, reason). An SVG loses a
+    leading BOM/whitespace (the app requires it to start with <svg or <?xml)."""
+    if len(data) > MAX_IMAGE_BYTES:
+        return None, f"is {len(data)} bytes, over the {MAX_IMAGE_BYTES} byte limit"
+    if data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff" or data[:4] == b"GIF8" or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"):
+        return data, None
+    try:
+        text = data.decode("utf-8").lstrip("﻿ \t\r\n")
+    except UnicodeDecodeError:
+        return None, "is not a PNG, JPEG, GIF, WebP or SVG image"
+    if not (text.startswith("<svg") or text.startswith("<?xml")) or not re.search(r"<svg[\s>]", text):
+        return None, "is not a PNG, JPEG, GIF, WebP or SVG image"
+    out = text.encode("utf-8")
+    try:
+        check_svg(out)
+    except RuntimeError as e:
+        return None, str(e)
+    return out, None
+
+
+def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=None):
+    """The `images` entries for one Markdown file: each local image it uses that exists at REV, once.
+    An image that is missing or that the app would reject is logged and left out (the page shows a note)."""
+    log = log or say
+    out, seen = [], set()
+    for src in image_srcs(content):
+        cands = image_candidates(path, src, prefix)
+        if not cands:
+            continue
+        found = next((c for c in cands if exists(c)), None)
+        if not found:
+            log(f"WARN {path}: image not found: {src}")
+            continue
+        if found in seen:
+            continue
+        seen.add(found)
+        data, problem = image_problem(read_bytes(found))
+        if problem:
+            log(f"WARN {path}: image {found} {problem}; not sent")
+            continue
+        out.append({"path": found, "hash": hashlib.sha256(data).hexdigest(), "data": base64.b64encode(data).decode("ascii")})
+    return out
+
+
+def add_images(files, git, prefix: str, mode: str = "on"):
+    """Attach `images` to the files (in place); returns the image count."""
+    if mode == "off":
+        return 0
+    tree, total = None, 0
+    for f in files:
+        content = f.get("content")
+        if not content or not ("![" in content or "<img" in content.lower()):
+            continue
+        if tree is None:
+            tree = set(git.tree_files())
+        imgs = images_for(f["path"], content, prefix, tree.__contains__, git.read_bytes)
+        if imgs:
+            f["images"] = imgs
+            total += len(imgs)
+    if total:
+        print(f"images: {total} local image(s) attached", flush=True)
+    return total
+
+
+def changed_image_paths(z: str):
+    """Image files a commit added, changed, renamed or deleted, from `git diff --name-status -z -M`
+    (old and new path of a rename). Any folder: images often live outside the docs prefix."""
+    parts, out, i = z.split("\0"), set(), 0
+    while i < len(parts) and parts[i]:
+        n = 3 if parts[i][0] in "RC" else 2
+        for p in parts[i + 1:i + n]:
+            if IMAGE_EXT_RE.search(p):
+                out.add(p)
+        i += n
+    return out
+
+
+def pages_using_images(git, changed, prefix: str, excludes, skip):
+    """Markdown files at REV (mapped, not in `skip`) that use one of the `changed` image paths: they
+    are re-sent so their pages get the new image (or the note, for a deleted one)."""
+    if not changed:
+        return []
+    names = sorted({p.rsplit("/", 1)[-1] for p in changed})
+    try:
+        hits = git.run("grep", "-l", "-F", "-z", *[a for n in names for a in ("-e", n)], git.sha, "--").split("\0")
+    except subprocess.CalledProcessError:
+        return []  # git grep exits 1 when nothing matches
+    out = []
+    for hit in hits:
+        path = hit.split(":", 1)[1] if ":" in hit else hit
+        if not path or path in skip or not wanted(path, prefix, excludes):
+            continue
+        content = git.read(path)
+        used = {c for src in image_srcs(content) for c in image_candidates(path, src, prefix)}
+        if used & changed:
+            out.append({"path": path, "action": "modified", "content": content})
+    return out
 
 
 # ---------------------------------------------------------------- diagrams
@@ -836,6 +1027,9 @@ class Git:
 
     def read(self, path: str) -> str:
         return self.run("show", f"{self.sha}:{path}")
+
+    def read_bytes(self, path: str) -> bytes:
+        return subprocess.run(["git", "-C", self.dir, "show", f"{self.sha}:{path}"], check=True, capture_output=True).stdout
 
     def tree_files(self):
         return [p for p in self.run("ls-tree", "-r", "-z", "--name-only", self.sha).split("\0") if p]
@@ -1503,7 +1697,7 @@ def run_pass(name, files, envelope, url, secret, dry_run, max_files=MAX_FILES, m
         label = f"{name} chunk {n}/{len(chunks)}"
         if dry_run:
             print(f"{label}: {len(c)} files, {payload_size(envelope, c)} bytes (dry run): "
-                  + ", ".join(f["path"] + (f" [{len(f['diagrams'])} image(s)]" if f.get("diagrams") else "") for f in c))
+                  + ", ".join(f["path"] + (f" [{image_count(f)} image(s)]" if image_count(f) else "") for f in c))
             continue
         status = send(url, secret, {**envelope, "files": c}, label)
         if status == 207:
@@ -1576,6 +1770,12 @@ def cmd_push(a) -> int:
                     files.append({"path": p, "action": "modified", "content": git.read(p)})
                 else:
                     print(f"WARN {p}: not a mapped Markdown file at {git.sha[:7]}; skipped", flush=True)
+    elif a.images == "on":
+        # A page whose Markdown did not change but whose image did (or was deleted) is sent again.
+        again = pages_using_images(git, changed_image_paths(z), prefix, excludes, {f["path"] for f in files})
+        if again:
+            print(f"images: {len(again)} page(s) re-sent for changed images: {', '.join(f['path'] for f in again)}", flush=True)
+            files += again
     if a.force:
         for f in files:
             if f["action"] != "removed":
@@ -1584,6 +1784,7 @@ def cmd_push(a) -> int:
         print(f"No Markdown changes under '{prefix}' in {git.sha[:7]}")
         return 0
     add_includes(files, git, a.includes)
+    add_images(files, git, prefix, a.images)
     if not render_or_report(files, a):
         return 2
     rc, partial = run_pass("push", files, envelope, url, secret, a.dry_run, a.max_files, a.max_bytes)
@@ -1820,12 +2021,13 @@ def cmd_import(a) -> int:
             f["force"] = True
         files.append(f)
     add_includes(files, git, a.includes)
+    add_images(files, git, prefix, a.images)
     if not render_or_report(files, a):
         return 2
     rc1, partial1 = run_pass("pass 1", files, envelope, url, secret, a.dry_run, a.max_files, a.max_bytes)
     if rc1:
         return rc1
-    # Pass 2 re-sends the same diagrams: the app's unchanged check includes them.
+    # Pass 2 re-sends the same diagrams and images: the app's unchanged check includes them.
     linked = [strip_force(f) for f in files if has_relative_md_link(f["content"])]
     rc2, partial2 = (run_pass("pass 2 (links)", linked, envelope, url, secret, a.dry_run, a.max_files, a.max_bytes)
                      if linked and not a.no_links_pass else (0, 0))
@@ -1914,6 +2116,38 @@ def cmd_selftest(_a) -> int:
     assert [(b["index"], b["lang"], b["line"], b["source"]) for b in fences] == [
         (0, "mermaid", 3, "graph LR\n  A-->B"), (1, "plantuml", 16, "a -> b")], fences
     assert find_diagram_fences("---\nx: 1\n---\n```mermaid\nA\n```")[0]["line"] == 4
+
+    # 6a. Local images: candidate paths and the images a file uses, against the shared vector.
+    vec3 = next((c.with_name("images-v1.json") for c in candidates if c.with_name("images-v1.json").is_file()), candidates[0].with_name("images-v1.json"))
+    if vec3.is_file():
+        iv = json.loads(vec3.read_text("utf-8"))
+        for c in iv["cases"]:
+            assert image_candidates(c["from"], c["src"], c["siteRoot"]) == c["candidates"], c
+        used = [cs[0] for cs in (image_candidates(iv["from"], s, iv["siteRoot"]) for s in image_srcs(iv["markdown"])) if cs]
+        assert list(dict.fromkeys(used)) == iv["images"], used
+        print(f"image vector ok ({vec3})")
+    png1 = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+    assert image_problem(png1) == (png1, None)
+    assert image_problem(b"\xff\xd8\xff\xe0rest")[1] is None and image_problem(b"GIF89a..")[1] is None
+    assert image_problem(b"RIFF\x00\x00\x00\x00WEBPVP8 ")[1] is None
+    assert image_problem("\ufeff  <svg xmlns='x'/>".encode()) == (b"<svg xmlns='x'/>", None)
+    assert "script" in image_problem(b"<svg><script>x</script></svg>")[1]
+    assert "not a PNG" in image_problem(b"%PDF-1.7")[1]
+    assert "byte limit" in image_problem(b"\x89PNG\r\n\x1a\n" + b"0" * MAX_IMAGE_BYTES)[1]
+    repo_files = {"docs/img/a.png": png1, "docs/img/bad.pdf.png": b"%PDF", "docs/s.svg": b"<svg xmlns='x'/>"}
+    logs = []
+    got = images_for("docs/p.md", "![a](img/a.png) ![again](./img/a.png) ![b](img/bad.pdf.png) ![c](missing.png) "
+                     "![r](https://e.com/x.png) <img src='s.svg'>", "docs/", repo_files.__contains__, repo_files.__getitem__, logs.append)
+    assert [i["path"] for i in got] == ["docs/img/a.png", "docs/s.svg"], got
+    assert got[0]["hash"] == hashlib.sha256(png1).hexdigest() and base64.b64decode(got[0]["data"]) == png1
+    assert logs == ["WARN docs/p.md: image docs/img/bad.pdf.png is not a PNG, JPEG, GIF, WebP or SVG image; not sent",
+                    "WARN docs/p.md: image not found: missing.png"], logs
+    z = "M\0docs/a.md\0A\0assets/new.png\0D\0docs/img/old.JPG\0R100\0x/a.svg\0y/b.svg\0M\0notes.txt\0"
+    assert changed_image_paths(z) == {"assets/new.png", "docs/img/old.JPG", "x/a.svg", "y/b.svg"}
+    big = {"path": "big.md", "action": "modified", "content": "x", "images": [{"path": "a.png", "hash": "0" * 64, "data": "A" * 9000}]}
+    logs = []
+    cs = chunk([big], {"repo": "o/r", "files": []}, max_bytes=5000, log=logs.append)
+    assert "images" not in cs[0][0] and "as notes" in logs[0], logs
 
     # 6b. Code includes.
     repo = {"docs_src/app.py": "a = 1\nb = 2\nc = 3\nd = 4\n", "docs/en/docs/x/data.json": '{"k": "```"}\n'}
@@ -2199,6 +2433,9 @@ def build_parser():
                        help=f"encoded payload bytes per call, images included (default and maximum: {MAX_BYTES})")
         p.add_argument("--includes", choices=("on", "off"), default="on",
                        help="on: inline FastAPI-style {* file *} code includes from the checkout (default); off: send markers as is")
+        p.add_argument("--images", choices=("on", "off"), default="on",
+                       help="on: send the local images the Markdown uses (PNG, JPEG, GIF, WebP, SVG; max 2 MiB each) "
+                            "from the checkout, and re-send pages whose images changed (default); off: pages show a note")
         p.add_argument("--render", choices=("auto", "off"), default="auto",
                        help="auto: render mermaid/plantuml blocks (default; a missing renderer is an error, exit 2, "
                             "nothing sent); off: send every block as code")

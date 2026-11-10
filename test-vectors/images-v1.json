@@ -1,0 +1,86 @@
+{
+  "comment": "Local images: candidate repo paths for an image src (the app's imagePaths, the client's image_candidates) and the images a Markdown file uses, in order, as the first candidate of each (the app's ConvertResult.images without attachments; the client's image_srcs mapped through image_candidates). Checked by test/convert.test.ts and repopages_push.py selftest.",
+  "cases": [
+    {
+      "from": "docs/guide/a.md",
+      "src": "img/x.png",
+      "siteRoot": "",
+      "candidates": [
+        "docs/guide/img/x.png"
+      ]
+    },
+    {
+      "from": "docs/guide/a.md",
+      "src": "./img/x.png?raw=1#top",
+      "siteRoot": "",
+      "candidates": [
+        "docs/guide/img/x.png"
+      ]
+    },
+    {
+      "from": "docs/guide/a.md",
+      "src": "../assets/my%20pic.png",
+      "siteRoot": "",
+      "candidates": [
+        "docs/assets/my pic.png"
+      ]
+    },
+    {
+      "from": "docs/guide/a.md",
+      "src": "/img/x.png",
+      "siteRoot": "docs/",
+      "candidates": [
+        "img/x.png",
+        "docs/img/x.png"
+      ]
+    },
+    {
+      "from": "docs/guide/a.md",
+      "src": "/img/x.png",
+      "siteRoot": "",
+      "candidates": [
+        "img/x.png"
+      ]
+    },
+    {
+      "from": "a.md",
+      "src": "../../x.png",
+      "siteRoot": "",
+      "candidates": []
+    },
+    {
+      "from": "a.md",
+      "src": "https://e.com/x.png",
+      "siteRoot": "",
+      "candidates": []
+    },
+    {
+      "from": "a.md",
+      "src": "//cdn.e.com/x.png",
+      "siteRoot": "",
+      "candidates": []
+    },
+    {
+      "from": "a.md",
+      "src": "data:image/png;base64,AAAA",
+      "siteRoot": "",
+      "candidates": []
+    },
+    {
+      "from": "a.md",
+      "src": "",
+      "siteRoot": "",
+      "candidates": []
+    }
+  ],
+  "from": "docs/guide/page.md",
+  "siteRoot": "docs/",
+  "markdown": "# Images\n\n![inline](img/a.png \"title\")\n\n![angle](<img/with space.png>)\n\n![ref][logo] and ![logo]\n\n[logo]: ../assets/logo.svg\n\n<img src=\"./img/b.jpg\" width=\"200\">\n\n![remote](https://e.com/r.png) ![abs](/static/c.gif)\n\n```md\n![in code](img/no.png)\n```\n\nInline `![code](img/no2.png)` text and ![dup](img/a.png).\n",
+  "images": [
+    "docs/guide/img/a.png",
+    "docs/guide/img/with space.png",
+    "docs/assets/logo.svg",
+    "docs/guide/img/b.jpg",
+    "static/c.gif"
+  ]
+}
