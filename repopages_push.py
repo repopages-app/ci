@@ -634,7 +634,8 @@ def pages_using_images(git, changed, prefix: str, excludes, skip):
     are re-sent so their pages get the new image (or the note, for a deleted one)."""
     if not changed:
         return []
-    names = sorted({p.rsplit("/", 1)[-1] for p in changed})
+    # The file name as written, and %-encoded (a reference to "my pic.png" is often written "my%20pic.png").
+    names = sorted({v for p in changed for v in (p.rsplit("/", 1)[-1], urllib.parse.quote(p.rsplit("/", 1)[-1]))})
     try:
         hits = git.run("grep", "-l", "-F", "-z", *[a for n in names for a in ("-e", n)], git.sha, "--").split("\0")
     except subprocess.CalledProcessError:
