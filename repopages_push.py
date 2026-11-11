@@ -701,15 +701,32 @@ def changed_image_paths(z: str):
     return out
 
 
+def name_pattern(name: str) -> str:
+    """POSIX ERE for a file name as Markdown may write it: letters and digits as is, any other
+    character as itself, backslash-escaped or %-encoded (upper or lower case hex)."""
+    out = []
+    for ch in name:
+        if ch.isalnum() and ch.isascii():
+            out.append(ch)
+            continue
+        enc = urllib.parse.quote(ch, safe="")
+        alts = [f"[{ch}]" if ch not in "]^\\" else ("\\" + ch)]
+        if enc != ch:
+            alts += [enc.upper(), enc.lower()]
+        out.append("\\\\?(" + "|".join(dict.fromkeys(alts)) + ")")
+    return "".join(out)
+
+
 def pages_using_images(git, changed, prefix: str, excludes, skip):
     """Markdown files at REV (mapped, not in `skip`) that use one of the `changed` image paths: they
     are re-sent so their pages get the new image (or the note, for a deleted one)."""
     if not changed:
         return []
-    # The file name as written, and %-encoded (a reference to "my pic.png" is often written "my%20pic.png").
-    names = sorted({v for p in changed for v in (p.rsplit("/", 1)[-1], urllib.parse.quote(p.rsplit("/", 1)[-1]))})
+    # The file name, where every character other than a letter or digit may also be written
+    # backslash-escaped ("a\\_b.png") or %-encoded ("my%20pic.png"), as Markdown allows.
+    patterns = sorted({name_pattern(p.rsplit("/", 1)[-1]) for p in changed})
     try:
-        hits = git.run("grep", "-l", "-F", "-z", *[a for n in names for a in ("-e", n)], git.sha, "--").split("\0")
+        hits = git.run("grep", "-l", "-E", "-z", *[a for n in patterns for a in ("-e", n)], git.sha, "--").split("\0")
     except subprocess.CalledProcessError as e:
         if e.returncode == 1:
             return []  # git grep exits 1 when nothing matches
@@ -2255,6 +2272,10 @@ def cmd_selftest(_a) -> int:
     # Comments, front matter, balanced parentheses and escapes in image destinations.
     assert image_srcs("---\nimage: ![](fm.png)\n---\n<!-- ![](old.png)\n -->\n![a](img/screen(1).png) ![b](img/a\\_b.png) ![c](img/x&amp;y.png)") == \
         ["img/screen(1).png", "img/a_b.png", "img/x&y.png"], image_srcs("![a](img/screen(1).png)")
+    # Changed images are found however their name is written (as is, backslash-escaped, %-encoded).
+    rx = re.compile(name_pattern("a_b c.png"))
+    assert all(rx.search(t) for t in ("img/a_b c.png", "img/a\\_b%20c.png", "a_b%20c.png", "a\\_b c\\.png")), rx.pattern
+    assert not rx.search("img/axb c.png")
     # A copy (C) only marks its new path as changed.
     assert changed_image_paths("C090\0img/logo.png\0img/logo-dark.png\0") == {"img/logo-dark.png"}
     # Git LFS: a pointer is reported clearly, never sent as an image.
