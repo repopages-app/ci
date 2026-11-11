@@ -7,7 +7,7 @@ name: RepoPages
 on:
   push:
     branches: [main]
-    paths: ['**/*.md', '**/*.markdown']
+    paths: ['**/*.md', '**/*.markdown', '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.webp', '**/*.svg']
   workflow_dispatch:
     inputs:
       full_import:

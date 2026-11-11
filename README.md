@@ -20,7 +20,7 @@ name: RepoPages
 on:
   push:
     branches: [main]
-    paths: ['**/*.md', '**/*.markdown']
+    paths: ['**/*.md', '**/*.markdown', '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.webp', '**/*.svg']
   workflow_dispatch:
     inputs:
       full_import:
@@ -69,7 +69,7 @@ repopages:
   image: ghcr.io/repopages-app/ci:1
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes: ['**/*.md', '**/*.markdown']
+      changes: ['**/*.md', '**/*.markdown', '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.webp', '**/*.svg']
     - if: $CI_PIPELINE_SOURCE == "web"   # Run pipeline with FULL_IMPORT=true for a full import
   variables:
     GIT_DEPTH: "2"

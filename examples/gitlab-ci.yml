@@ -7,7 +7,7 @@ repopages:
     - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger"
       when: never   # those pipelines run repopages-pull-edits below (`changes` is always true for them)
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes: ['**/*.md', '**/*.markdown']
+      changes: ['**/*.md', '**/*.markdown', '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.webp', '**/*.svg']
     - if: $CI_PIPELINE_SOURCE == "web"   # Run pipeline with FULL_IMPORT=true for a full import
   variables:
     GIT_DEPTH: "2"
