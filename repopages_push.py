@@ -29,7 +29,10 @@ images, `<img src>`; resolved like the app resolves them: relative to the file, 
 root and then --prefix) are read from REV and sent as the file's `images`. PNG, JPEG, GIF, WebP and SVG
 (no <script>), at most 2 MiB each; one that is missing or not accepted is logged as
 `WARN <file>: image ...` and the page shows a note. `push` also re-sends the pages that use an image
-the commit added, changed, renamed or deleted, so they pick up the new image. Remote https:// images
+the commit added, changed, renamed or deleted, so they pick up the new image (not with `push PATH...`,
+which sends only the named files). Images stored with Git LFS need the LFS files checked out (actions/checkout
+with lfs: true, or git lfs pull); a pointer is reported as `WARN <file>: image ... is a Git LFS pointer`. When a
+page does not fit one call with all its images, only the largest images are left out (notes), until it fits. Remote https:// images
 are embedded by URL by the app and not sent.
 
 Diagrams (--render auto, the default): every ```mermaid and ```plantuml block is rendered and sent
@@ -356,10 +359,24 @@ def chunk(files, envelope: dict, max_files: int = MAX_FILES, max_bytes: int = MA
     chunks, cur, cur_bytes = [], [], base
     for f in files:
         size = len(encode(f))
-        if base + size > max_bytes and image_count(f):
-            log(f"WARN {f['path']}: {base + size} bytes with {image_count(f)} image(s) exceeds {max_bytes} "
-                "even alone; sending its diagrams as code and its images as notes")
-            f = strip_images(f)
+        if base + size > max_bytes and f.get("images"):
+            # Drop local images, largest first, only until the page fits; they become notes.
+            f = dict(f)
+            imgs = sorted(f["images"], key=lambda i: len(i["data"]))
+            dropped = []
+            while imgs and base + size > max_bytes:
+                dropped.append(imgs.pop())
+                f["images"] = [i for i in f["images"] if i in imgs]
+                f["imagesSkipped"] = ((f.get("imagesSkipped") or []) + [{"src": dropped[-1]["path"][:1000], "reason": "too-large-page"}])[:500]
+                if not f["images"]:
+                    del f["images"]
+                size = len(encode(f))
+            log(f"WARN {f['path']}: does not fit one call with all its images; {len(dropped)} image(s) left out "
+                f"(the page shows notes): {', '.join(i['path'] for i in dropped)}")
+        if base + size > max_bytes and f.get("diagrams"):
+            log(f"WARN {f['path']}: {base + size} bytes with {len(f['diagrams'])} diagram image(s) exceeds {max_bytes} "
+                "even alone; sending its diagrams as code")
+            f = {k: v for k, v in f.items() if k != "diagrams"}
             size = len(encode(f))
         if base + size > max_bytes:
             raise ValueError(f"{f['path']} alone exceeds {max_bytes} bytes of payload; exclude it or split the file")
@@ -482,7 +499,18 @@ def add_includes(files, git, mode: str = "on"):
 # ---------------------------------------------------------------- local images
 
 IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)$", re.I)
-MD_IMAGE_RE = re.compile(r"!\[(?:[^\]\\]|\\.)*\]\(\s*(<[^>\n]*>|[^)\s]+)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)")
+MD_IMAGE_RE = re.compile(r"!\[(?:[^\]\\]|\\.)*\]\(\s*(<[^>\n]*>|(?:[^()\s\\]|\\.|\([^()\s]*\))+)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)")
+HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|$)", re.S)
+FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\n.*?\n(?:---|\.\.\.)[ \t]*(?:\n|\Z)", re.S)
+LFS_POINTER = b"version https://git-lfs.github.com/spec/v1"
+
+
+def link_destination(raw: str) -> str:
+    """A Markdown link destination as the app's parser reads it: <...> unwrapped, backslash
+    escapes and HTML entities decoded."""
+    if raw.startswith("<") and raw.endswith(">"):
+        return raw[1:-1]
+    return html.unescape(re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", raw))
 REF_IMAGE_RE = re.compile(r"!\[((?:[^\]\\]|\\.)*)\](?:\[([^\]]*)\])?(?![(\[:])")
 REF_DEF_RE = re.compile(r"^[ ]{0,3}\[((?:[^\]\\]|\\.)+)\]:[ \t]*(<[^>\n]*>|\S+)", re.M)
 HTML_IMG_RE = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.I)
@@ -527,7 +555,9 @@ def image_candidates(from_path: str, src: str, site_root: str = ""):
 def image_srcs(markdown: str):
     """Image sources the Markdown uses, in document order, once each: inline `![](src)`, reference
     `![alt][id]` / `![id]` with `[id]: src`, and HTML `<img src>`. Fenced code and inline code are skipped."""
-    lines, kept, fence = markdown.replace("\r\n", "\n").split("\n"), [], None
+    text = FRONT_MATTER_RE.sub("", markdown.replace("\r\n", "\n"))
+    text = HTML_COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), text)  # keep line numbers
+    lines, kept, fence = text.split("\n"), [], None
     for line in lines:
         fm = FENCE_RE.match(line.lstrip(" "))
         if fence:
@@ -541,10 +571,10 @@ def image_srcs(markdown: str):
     text = "\n".join(kept)
     defs = {}
     for m in REF_DEF_RE.finditer(text):
-        defs.setdefault(re.sub(r"\s+", " ", m.group(1)).strip().lower(), m.group(2).strip("<>"))
+        defs.setdefault(re.sub(r"\s+", " ", m.group(1)).strip().lower(), link_destination(m.group(2)))
     found = []
     for m in MD_IMAGE_RE.finditer(text):
-        found.append((m.start(), m.group(1).strip("<>")))
+        found.append((m.start(), link_destination(m.group(1))))
     inline_spans = [m.span() for m in MD_IMAGE_RE.finditer(text)]
     for m in REF_IMAGE_RE.finditer(text):
         if any(a <= m.start() < b for a, b in inline_spans):
@@ -560,6 +590,9 @@ def image_srcs(markdown: str):
 def image_problem(data: bytes):
     """(bytes to send, None) when the app accepts this image, else (None, reason). An SVG loses a
     leading BOM/whitespace (the app requires it to start with <svg or <?xml)."""
+    if data.startswith(LFS_POINTER):
+        return None, ("is a Git LFS pointer, not the image; fetch LFS files before running the client "
+                      "(actions/checkout with lfs: true, or git lfs pull)")
     if len(data) > MAX_IMAGE_BYTES:
         return None, f"is {len(data)} bytes, over the {MAX_IMAGE_BYTES} byte limit"
     if data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff" or data[:4] == b"GIF8" or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"):
@@ -595,7 +628,7 @@ def svg_active_content(text: str):
     return None
 
 
-def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=None):
+def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=None, cache=None):
     """(images, skipped) for one Markdown file: each local image it uses that exists at REV, once;
     and the ones left out (missing, or rejected by the app's rules: logged, the page shows a note),
     as `imagesSkipped` entries {src, reason} so the app can report them to the vendor."""
@@ -613,7 +646,12 @@ def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=Non
         if found in seen:
             continue
         seen.add(found)
-        data, problem = image_problem(read_bytes(found))
+        if cache is not None and found in cache:
+            data, problem = cache[found]
+        else:
+            data, problem = image_problem(read_bytes(found))
+            if cache is not None:
+                cache[found] = (data, problem)
         if problem:
             log(f"WARN {path}: image {found} {problem}; not sent")
             skipped.append({"src": found[:1000], "reason": "too-large-image" if "byte limit" in problem else "unsupported"})
@@ -630,14 +668,14 @@ def add_images(files, git, prefix: str, mode: str = "on"):
     """Attach `images` to the files (in place); returns the image count."""
     if mode == "off":
         return 0
-    tree, total = None, 0
+    tree, total, cache = None, 0, {}  # each image is read and checked once, however many pages use it
     for f in files:
         content = f.get("content")
         if not content or not ("![" in content or "<img" in content.lower()):
             continue
         if tree is None:
             tree = set(git.tree_files())
-        imgs, skipped = images_for(f["path"], content, prefix, tree.__contains__, git.read_bytes)
+        imgs, skipped = images_for(f["path"], content, prefix, tree.__contains__, git.read_bytes, cache=cache)
         if imgs:
             f["images"] = imgs
             total += len(imgs)
@@ -654,7 +692,9 @@ def changed_image_paths(z: str):
     parts, out, i = z.split("\0"), set(), 0
     while i < len(parts) and parts[i]:
         n = 3 if parts[i][0] in "RC" else 2
-        for p in parts[i + 1:i + n]:
+        # A copy leaves its source unchanged: only the new path counts.
+        paths = parts[i + 2:i + 3] if parts[i][0] == "C" else parts[i + 1:i + n]
+        for p in paths:
             if IMAGE_EXT_RE.search(p):
                 out.add(p)
         i += n
@@ -670,8 +710,12 @@ def pages_using_images(git, changed, prefix: str, excludes, skip):
     names = sorted({v for p in changed for v in (p.rsplit("/", 1)[-1], urllib.parse.quote(p.rsplit("/", 1)[-1]))})
     try:
         hits = git.run("grep", "-l", "-F", "-z", *[a for n in names for a in ("-e", n)], git.sha, "--").split("\0")
-    except subprocess.CalledProcessError:
-        return []  # git grep exits 1 when nothing matches
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 1:
+            return []  # git grep exits 1 when nothing matches
+        print(f"WARN could not search for pages that use the changed images (git grep exit {e.returncode}); "
+              "use push --force PATH for those pages", file=sys.stderr, flush=True)
+        return []
     out = []
     for hit in hits:
         path = hit.split(":", 1)[1] if ":" in hit else hit
@@ -1062,7 +1106,17 @@ class Git:
         return self.run("show", f"{self.sha}:{path}")
 
     def read_bytes(self, path: str) -> bytes:
-        return subprocess.run(["git", "-C", self.dir, "show", f"{self.sha}:{path}"], check=True, capture_output=True).stdout
+        """The file at REV. A Git LFS pointer is replaced by the checked-out file when that file's
+        SHA-256 is the pointer's oid (CI checked out with LFS); otherwise the pointer is returned."""
+        data = subprocess.run(["git", "-C", self.dir, "show", f"{self.sha}:{path}"], check=True, capture_output=True).stdout
+        if data.startswith(LFS_POINTER):
+            m = re.search(rb"^oid sha256:([0-9a-f]{64})$", data, re.M)
+            local = Path(self.dir, path)
+            if m and local.is_file():
+                real = local.read_bytes()
+                if hashlib.sha256(real).hexdigest() == m.group(1).decode():
+                    return real
+        return data
 
     def tree_files(self):
         return [p for p in self.run("ls-tree", "-r", "-z", "--name-only", self.sha).split("\0") if p]
@@ -2186,8 +2240,26 @@ def cmd_selftest(_a) -> int:
     big = {"path": "big.md", "action": "modified", "content": "x", "images": [{"path": "a.png", "hash": "0" * 64, "data": "A" * 9000}]}
     logs = []
     cs = chunk([big], {"repo": "o/r", "files": []}, max_bytes=5000, log=logs.append)
-    assert "images" not in cs[0][0] and "as notes" in logs[0], logs
+    assert "images" not in cs[0][0] and "left out" in logs[0], logs
     assert cs[0][0]["imagesSkipped"] == [{"src": "a.png", "reason": "too-large-page"}], cs[0][0]
+    # Only as many images as needed are dropped (largest first); small images and diagrams stay.
+    img = lambda p, n: {"path": p, "hash": "0" * 64, "data": "A" * n}
+    page = {"path": "p.md", "action": "modified", "content": "x", "images": [img("small.png", 500), img("big.png", 6000), img("mid.png", 2000)],
+            "diagrams": [{"index": 0, "lang": "mermaid", "hash": "0" * 64, "svg": "A" * 400, "width": 1, "height": 1}]}
+    logs = []
+    cs = chunk([page], {"repo": "o/r", "files": []}, max_bytes=5000, log=logs.append)
+    sent = cs[0][0]
+    assert [i["path"] for i in sent["images"]] == ["small.png", "mid.png"] and "diagrams" in sent, sent.keys()
+    assert sent["imagesSkipped"] == [{"src": "big.png", "reason": "too-large-page"}] and "1 image(s) left out" in logs[0], logs
+    assert "images" in page and len(page["images"]) == 3  # the caller's dict is not changed
+    # Comments, front matter, balanced parentheses and escapes in image destinations.
+    assert image_srcs("---\nimage: ![](fm.png)\n---\n<!-- ![](old.png)\n -->\n![a](img/screen(1).png) ![b](img/a\\_b.png) ![c](img/x&amp;y.png)") == \
+        ["img/screen(1).png", "img/a_b.png", "img/x&y.png"], image_srcs("![a](img/screen(1).png)")
+    # A copy (C) only marks its new path as changed.
+    assert changed_image_paths("C090\0img/logo.png\0img/logo-dark.png\0") == {"img/logo-dark.png"}
+    # Git LFS: a pointer is reported clearly, never sent as an image.
+    ptr = b"version https://git-lfs.github.com/spec/v1\noid sha256:" + b"a" * 64 + b"\nsize 123\n"
+    assert "Git LFS pointer" in image_problem(ptr)[1]
 
     # 6b. Code includes.
     repo = {"docs_src/app.py": "a = 1\nb = 2\nc = 3\nd = 4\n", "docs/en/docs/x/data.json": '{"k": "```"}\n'}
