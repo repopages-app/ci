@@ -144,6 +144,7 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 MD_RE = re.compile(r"\.(md|markdown)$", re.I)
 DIAGRAM_LANGS = ("mermaid", "plantuml")
 MAX_IMAGE_BYTES = 2 * 1024 * 1024  # per PNG and per SVG, enforced by the app too
+MAX_IMAGES_PER_FILE = 500  # local images per Markdown file, enforced by the app too
 DIAGRAM_FORMATS = ("svg", "png", "both")
 RENDER_TIMEOUT_S = 90
 
@@ -574,7 +575,24 @@ def image_problem(data: bytes):
         check_svg(out)
     except RuntimeError as e:
         return None, str(e)
+    active = svg_active_content(text)
+    if active:
+        return None, active
     return out, None
+
+
+def svg_active_content(text: str):
+    """The app's svgActiveContent: a repository SVG with event handlers, javascript: links or
+    embedded HTML/documents is rejected (not cleaned). Returns the reason, or None."""
+    if re.search(r"<script", text, re.I):
+        return "contains <script"
+    if re.search(r"<(foreignObject|iframe|embed|object)\b", text, re.I):
+        return "embeds HTML or other documents (foreignObject, iframe, embed, object)"
+    if re.search(r"<[^>]*[\s\"'/]on[a-z]+\s*=", text, re.I):
+        return "contains event handler attributes (onload=, onclick=, ...)"
+    if re.search(r"javascript\s*:", text, re.I) or re.search(r"href\s*=\s*[\"']?\s*&#", text, re.I):
+        return "contains javascript: links"
+    return None
 
 
 def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=None):
@@ -601,6 +619,10 @@ def images_for(path: str, content: str, prefix: str, exists, read_bytes, log=Non
             skipped.append({"src": found[:1000], "reason": "too-large-image" if "byte limit" in problem else "unsupported"})
             continue
         out.append({"path": found, "hash": hashlib.sha256(data).hexdigest(), "data": base64.b64encode(data).decode("ascii")})
+    if len(out) > MAX_IMAGES_PER_FILE:  # the app's limit per file
+        log(f"WARN {path}: {len(out)} images, more than {MAX_IMAGES_PER_FILE}; the rest are not sent")
+        skipped += [{"src": i["path"][:1000], "reason": "too-large-page"} for i in out[MAX_IMAGES_PER_FILE:]]
+        out = out[:MAX_IMAGES_PER_FILE]
     return out, skipped
 
 
@@ -2143,6 +2165,11 @@ def cmd_selftest(_a) -> int:
     assert image_problem(b"RIFF\x00\x00\x00\x00WEBPVP8 ")[1] is None
     assert image_problem("\ufeff  <svg xmlns='x'/>".encode()) == (b"<svg xmlns='x'/>", None)
     assert "script" in image_problem(b"<svg><script>x</script></svg>")[1]
+    assert "event handler" in image_problem(b"<svg xmlns='x' onload='alert(1)'/>")[1]
+    assert "javascript:" in image_problem(b"<svg xmlns='x'><a href='javascript:x()'>a</a></svg>")[1]
+    assert "javascript:" in image_problem(b"<svg xmlns='x'><a href='&#106;avascript:x()'>a</a></svg>")[1]
+    assert "embeds HTML" in image_problem(b"<svg xmlns='x'><foreignObject/></svg>")[1]
+    assert image_problem(b"<svg xmlns='x'><text>one = 1</text></svg>")[1] is None
     assert "not a PNG" in image_problem(b"%PDF-1.7")[1]
     assert "byte limit" in image_problem(b"\x89PNG\r\n\x1a\n" + b"0" * MAX_IMAGE_BYTES)[1]
     repo_files = {"docs/img/a.png": png1, "docs/img/bad.pdf.png": b"%PDF", "docs/s.svg": b"<svg xmlns='x'/>"}
